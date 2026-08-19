@@ -1,0 +1,151 @@
+name: Build macOS apps
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            artifact: ParserOnSocial-mac-arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            artifact: ParserOnSocial-mac-x86_64
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      MAC_ARCH: ${{ matrix.arch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Show build architecture
+        run: |
+          uname -m
+          python -c "import platform, sys; print(platform.machine()); print(sys.version)"
+
+      - name: Build .app
+        run: |
+          chmod +x build/build_mac.sh
+          build/build_mac.sh
+
+      - name: Validate final app
+        run: |
+          APP="build/dist/ParserOnSocial.app"
+          BIN="$APP/Contents/MacOS/ParserOnSocial"
+          test -x "$BIN"
+          lipo -archs "$BIN"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            lipo -archs "$BIN" | grep -qw arm64
+          else
+            lipo -archs "$BIN" | grep -qw x86_64
+          fi
+
+      - name: Add first-run instructions
+        run: |
+          cat > build/dist/README-MAC-FIRST-RUN.txt <<'EOF'
+          ParserOnSocial — первый запуск на macOS
+
+          1. Установите Google Chrome.
+          2. Распакуйте архив и запустите ParserOnSocial.app.
+          3. При предупреждении macOS выберите Open/Открыть или откройте
+             приложение через правую кнопку мыши → Open.
+          4. В приложении войдите в ON Social и Google вручную.
+
+          Архитектура этой версии: ${{ matrix.arch }}
+          arm64 — Apple Silicon.
+          x86_64 — Intel Mac.
+
+          Профиль Chrome и данные авторизации хранятся вне .app:
+          ~/Library/Application Support/OnSocialLocalParser/browser_profile
+          EOF
+
+      - name: Smoke test — launch the real .app
+        shell: bash
+        run: |
+          set -u
+          APP="$PWD/build/dist/ParserOnSocial.app"
+          BIN="$APP/Contents/MacOS/ParserOnSocial"
+          LOG_DIR="$PWD/build/smoke-test"
+          mkdir -p "$LOG_DIR"
+
+          echo "Launching: $APP" | tee "$LOG_DIR/launch.txt"
+          echo "Runner: $(uname -m)" | tee -a "$LOG_DIR/launch.txt"
+          echo "Binary architectures: $(lipo -archs "$BIN")" | tee -a "$LOG_DIR/launch.txt"
+
+          # Give Launch Services the same .app bundle that a real user opens.
+          open "$APP" 2>&1 | tee -a "$LOG_DIR/launch.txt" || true
+
+          running=0
+          for i in {1..20}; do
+            if pgrep -x "ParserOnSocial" >/dev/null 2>&1; then
+              running=1
+              echo "Application process detected after ${i}s." | tee -a "$LOG_DIR/launch.txt"
+              break
+            fi
+
+            # If the GUI app is started through the bundle launcher, the exact
+            # executable path can be absent briefly while Launch Services starts it.
+            ps axo pid=,comm= | grep -F "ParserOnSocial.app/Contents/MacOS/ParserOnSocial" | grep -v grep || true
+            sleep 1
+          done
+
+          ps auxww | grep -F "ParserOnSocial" | grep -v grep | tee "$LOG_DIR/processes.txt" || true
+          log show --style compact --last 90s --predicate 'process == "ParserOnSocial"' 2>&1 | tee "$LOG_DIR/macos-log.txt" || true
+
+          if [[ "$running" -ne 1 ]]; then
+            echo "ERROR: ParserOnSocial.app did not stay running after launch." | tee -a "$LOG_DIR/launch.txt"
+            exit 1
+          fi
+
+          echo "PASS: macOS application launched successfully for ${{ matrix.arch }}." | tee -a "$LOG_DIR/launch.txt"
+
+      - name: Collect smoke-test diagnostics
+        if: always()
+        shell: bash
+        run: |
+          APP_DATA="$HOME/Library/Application Support/OnSocialLocalParser"
+          mkdir -p build/smoke-test
+
+          if [[ -d "$APP_DATA" ]]; then
+            cp -R "$APP_DATA" build/smoke-test/app-data || true
+          fi
+
+          find build/smoke-test -maxdepth 4 -type f -print | sort || true
+
+          # Stop only our application process so the hosted runner can finish cleanly.
+          pkill -f 'ParserOnSocial.app/Contents/MacOS/ParserOnSocial' || true
+
+      - name: Upload smoke-test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-${{ matrix.artifact }}
+          path: build/smoke-test
+          if-no-files-found: warn
+
+      - name: Zip app bundle
+        run: |
+          cd build/dist
+          ditto -c -k --sequesterRsrc --keepParent ParserOnSocial.app ParserOnSocial-mac-${{ matrix.arch }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/dist/ParserOnSocial-mac-${{ matrix.arch }}.zip

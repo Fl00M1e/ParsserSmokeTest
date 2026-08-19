@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+credentials.json
+token.json
+browser_profile/
+debug_dump.txt
