@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 import time
 from typing import Iterable, Optional
@@ -613,51 +614,135 @@ class GoogleSheetsWriter:
 
     def _read_active_sheet_matrix(self) -> list[list[str]]:
         """
-        Copies the complete contiguous table/data region of the active tab.
-        Google Sheets handles the selection; the data is read only from the
-        system Clipboard and immediately parsed into normalized pairs.
+        Надёжно копирует весь используемый диапазон активного листа.
+
+        Важно: Google Sheets иногда не отдаёт Clipboard, если фокус остаётся
+        в Name Box или если первый Ctrl+A сработал не по сетке. Поэтому здесь
+        несколько попыток с возвратом фокуса в сетку, более длинным ожиданием и
+        дополнительной проверкой через browser Clipboard API.
         """
         self._require_connection()
         page = self.sheet_page
         if page is None:
             raise RuntimeError("Страница Google Sheets недоступна.")
 
+        page.bring_to_front()
         self._goto_cell("A1")
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(500)
 
-        sentinel = "__ONSOCIAL_FULL_SHEET_SENTINEL__"
-        pyperclip.copy(sentinel)
+        sentinel = "__ONSOCIAL_FULL_SHEET_SENTINEL_8F2A__"
 
-        # Google Sheets: first Ctrl+A selects the current data region; a second
-        # Ctrl+A expands the selection to the whole used sheet/document region.
-        page.keyboard.press(f"{COPY_MOD}+A")
-        page.wait_for_timeout(180)
-        page.keyboard.press(f"{COPY_MOD}+A")
-        page.wait_for_timeout(220)
-        page.keyboard.press(f"{COPY_MOD}+C")
+        def read_clipboard() -> str:
+            # На macOS читаем системный pasteboard напрямую через pbpaste.
+            # Это надёжнее pyperclip для приложений, запущенных из Finder/VS Code,
+            # и не зависит от выбора backend pyperclip.
+            if sys.platform == "darwin":
+                try:
+                    result = subprocess.run(
+                        ["/usr/bin/pbpaste"],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                    )
+                    value = result.stdout or ""
+                    if value and value != sentinel:
+                        return value
+                except Exception:
+                    pass
 
-        raw = ""
-        deadline = time.time() + 8.0
-        while time.time() < deadline:
-            page.wait_for_timeout(200)
+            # Windows/Linux и запасной вариант для macOS.
             try:
-                raw = pyperclip.paste() or ""
+                value = pyperclip.paste() or ""
+                if value and value != sentinel:
+                    return value
             except Exception:
+                pass
+
+            # Затем пробуем Clipboard API самой страницы.
+            try:
+                value = page.evaluate(
+                    "navigator.clipboard.readText()"
+                ) or ""
+                if value and value != sentinel:
+                    return value
+            except Exception:
+                pass
+            return ""
+
+        def write_sentinel() -> None:
+            if sys.platform == "darwin":
+                try:
+                    subprocess.run(
+                        ["/usr/bin/pbcopy"],
+                        input=sentinel,
+                        text=True,
+                        capture_output=True,
+                        timeout=2,
+                    )
+                    return
+                except Exception:
+                    pass
+            pyperclip.copy(sentinel)
+
+        last_error = ""
+        clipboard_backend = "pbpaste/pbcopy + pyperclip" if sys.platform == "darwin" else "pyperclip"
+        self.log(f"Google Sheets: проверяю системный Clipboard через {clipboard_backend}.")
+        for attempt in range(1, 6):
+            try:
+                # Гарантируем фокус на самой таблице, а не в Name Box.
+                # Клик немного правее/ниже Name Box обычно попадает в grid.
+                try:
+                    page.mouse.click(650, 320)
+                    page.wait_for_timeout(150)
+                except Exception:
+                    pass
+
+                write_sentinel()
+
+                # Escape снимает возможный фокус/редактирование ячейки.
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(100)
+
+                # В Google Sheets: Ctrl+A первый раз = текущий регион данных,
+                # второй = весь используемый диапазон листа.
+                page.keyboard.press(f"{COPY_MOD}+A")
+                page.wait_for_timeout(250)
+                page.keyboard.press(f"{COPY_MOD}+A")
+                page.wait_for_timeout(400)
+                page.keyboard.press(f"{COPY_MOD}+C")
+
+                deadline = time.time() + 10.0
                 raw = ""
-            if raw != sentinel:
-                break
+                while time.time() < deadline:
+                    page.wait_for_timeout(250)
+                    raw = read_clipboard()
+                    if raw:
+                        break
 
-        if raw == sentinel or raw == "":
-            raise RuntimeError(
-                "Google Sheets не вернул содержимое активной вкладки в Clipboard."
+                if raw:
+                    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+                    matrix = [line.split("\t") for line in lines]
+                    self.log(
+                        f"Google Sheets: Clipboard успешно прочитан с попытки {attempt}; "
+                        f"строк: {len(matrix):,}"
+                    )
+                    return matrix
+
+                last_error = "Clipboard остался пустым или равен sentinel."
+            except Exception as exc:
+                last_error = repr(exc)
+
+            self.log(
+                f"Google Sheets: не удалось получить Clipboard с попытки {attempt}/5: {last_error}"
             )
+            page.wait_for_timeout(900)
 
-        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        while lines and not lines[-1].strip():
-            lines.pop()
-
-        matrix = [line.split("\t") for line in lines]
-        return matrix
+        raise RuntimeError(
+            "Google Sheets не вернул содержимое активной вкладки в Clipboard "
+            f"после 5 попыток. Последняя причина: {last_error}"
+        )
 
     @staticmethod
     def _extract_pairs_from_matrix(matrix: list[list[str]]) -> set[tuple[str, str]]:
