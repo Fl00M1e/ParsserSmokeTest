@@ -320,6 +320,519 @@ class GoogleSheetsWriter:
         )
 
     # ============================================================
+    # LOAD ALL TABS FOR DEDUPLICATION
+    # ============================================================
+
+    def _open_all_sheets_menu(self) -> bool:
+        """Open Google Sheets' 'All sheets' popup if available."""
+        page = self.sheet_page
+        if page is None:
+            raise RuntimeError("Страница Google Sheets недоступна.")
+
+        selectors = [
+            '[aria-label*="All sheets"]',
+            '[data-tooltip*="All sheets"]',
+            '[title*="All sheets"]',
+            '[aria-label*="Все листы"]',
+            '[data-tooltip*="Все листы"]',
+            '[title*="Все листы"]',
+            'button[aria-label*="All sheets"]',
+            'button[aria-label*="Все листы"]',
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 20)
+                for i in range(count):
+                    item = loc.nth(i)
+                    try:
+                        if item.is_visible():
+                            item.click()
+                            page.wait_for_timeout(300)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
+    def _close_all_sheets_menu(self):
+        try:
+            self.sheet_page.keyboard.press("Escape")
+            self.sheet_page.wait_for_timeout(150)
+        except Exception:
+            pass
+
+    def _normalize_sheet_label(self, value: str) -> str:
+        value = re.sub(r"\s+", " ", (value or "")).strip()
+        value = re.sub(r"\s+[⌘⌥⇧⌃].*$", "", value).strip()
+        return value
+
+    def _collect_rendered_sheet_names(self) -> list[str]:
+        """Collect names only from DOM nodes that look like actual sheet tabs."""
+        page = self.sheet_page
+        if page is None:
+            return []
+
+        names: list[str] = []
+        # Google Sheets' tab DOM has historically used docs-sheet-tab / docs-sheet-tab-name.
+        # We deliberately do NOT use generic [role=tab], because Google Sheets' top
+        # application menu can expose unrelated nodes with tab-like ARIA roles.
+        selectors = [
+            '.docs-sheet-tab',
+            '[class*="docs-sheet-tab"]',
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 300)
+                for i in range(count):
+                    item = loc.nth(i)
+                    try:
+                        if not item.is_visible():
+                            continue
+                        label = (
+                            item.locator('.docs-sheet-tab-name').first.text_content()
+                            if item.locator('.docs-sheet-tab-name').count()
+                            else None
+                        )
+                        label = label or item.get_attribute('data-tooltip') or item.get_attribute('aria-label') or item.inner_text()
+                        label = self._normalize_sheet_label(label)
+                        if not label:
+                            continue
+                        low = label.casefold()
+                        if low in {'all sheets', 'все листы'}:
+                            continue
+                        # Hard block common Google Sheets application-menu labels. These are
+                        # never sheet names and this prevents a false-positive fallback.
+                        if low in {
+                            'файл', 'правка', 'вид', 'вставка', 'формат', 'данные',
+                            'инструменты', 'расширения', 'справка',
+                            'file', 'edit', 'view', 'insert', 'format', 'data',
+                            'tools', 'extensions', 'help',
+                        }:
+                            continue
+                        if label not in names:
+                            names.append(label)
+                    except Exception:
+                        continue
+                if names:
+                    break
+            except Exception:
+                continue
+        return names
+
+    def _collect_all_sheets_menu_names(self) -> list[str]:
+        """Collect sheet names from the real 'All sheets' popup only."""
+        page = self.sheet_page
+        if page is None:
+            return []
+        names: list[str] = []
+        # Prefer the sheet-specific menu item classes. Only fall back to generic roles
+        # after confirming that the popup is actually open.
+        selectors = [
+            '.docs-sheet-tab-menu-item',
+            '[class*="docs-sheet-tab-menu"]',
+            '[data-sheet-id]',
+        ]
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 300)
+                for i in range(count):
+                    item = loc.nth(i)
+                    try:
+                        if not item.is_visible():
+                            continue
+                        label = item.get_attribute('aria-label') or item.get_attribute('data-tooltip')
+                        if not label:
+                            if item.locator('.docs-sheet-tab-name').count():
+                                label = item.locator('.docs-sheet-tab-name').first.text_content()
+                            else:
+                                label = item.inner_text()
+                        label = self._normalize_sheet_label(label)
+                        if not label:
+                            continue
+                        low = label.casefold()
+                        if low in {'all sheets', 'все листы'}:
+                            continue
+                        if low in {
+                            'файл', 'правка', 'вид', 'вставка', 'формат', 'данные',
+                            'инструменты', 'расширения', 'справка',
+                            'file', 'edit', 'view', 'insert', 'format', 'data',
+                            'tools', 'extensions', 'help',
+                        }:
+                            continue
+                        if label not in names:
+                            names.append(label)
+                    except Exception:
+                        continue
+                if names:
+                    return names
+            except Exception:
+                continue
+        return names
+
+    def list_sheet_tabs(self) -> list[str]:
+        """
+        Return the real Google Sheets worksheet names only.
+
+        The implementation intentionally avoids generic ARIA roles such as
+        [role="tab"] / [role="menuitem"] because Google Sheets can expose
+        unrelated application-menu elements through those roles. We use the
+        sheet-specific DOM classes first and only accept names that survive the
+        strict filters above.
+        """
+        self._require_connection()
+        page = self.sheet_page
+        if page is None:
+            raise RuntimeError("Страница Google Sheets недоступна.")
+
+        names: list[str] = []
+
+        # 1. Open the dedicated 'All sheets' popup and read only sheet-specific nodes.
+        if self._open_all_sheets_menu():
+            try:
+                page.wait_for_timeout(250)
+                names = self._collect_all_sheets_menu_names()
+            finally:
+                self._close_all_sheets_menu()
+
+        # 2. Fallback to the actual rendered worksheet tabs, never generic role=tab.
+        if not names:
+            names = self._collect_rendered_sheet_names()
+
+        if not names:
+            raise RuntimeError(
+                "Не удалось определить реальные листы Google Sheets. "
+                "Загрузка остановлена, чтобы бот не прочитал меню Google Sheets вместо листов."
+            )
+
+        self.log("Google Sheets: обнаружены реальные листы: " + ", ".join(f'«{n}»' for n in names))
+        return names
+
+    def _select_sheet_specific_element(self, target: str) -> bool:
+        """Click a visible real worksheet-tab DOM element by exact label."""
+        page = self.sheet_page
+        if page is None:
+            return False
+        target = self._normalize_sheet_label(target)
+        selectors = ['.docs-sheet-tab', '[class*="docs-sheet-tab"]']
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 300)
+                for i in range(count):
+                    item = loc.nth(i)
+                    try:
+                        if not item.is_visible():
+                            continue
+                        label = None
+                        if item.locator('.docs-sheet-tab-name').count():
+                            label = item.locator('.docs-sheet-tab-name').first.text_content()
+                        label = label or item.get_attribute('data-tooltip') or item.get_attribute('aria-label') or item.inner_text()
+                        label = self._normalize_sheet_label(label)
+                        if label == target:
+                            item.click()
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
+    def _activate_sheet_tab_by_name(self, name: str):
+        """Activate one real Google Sheets worksheet tab by exact name.
+
+        This is the single entry point used by full-table loading.  It deliberately
+        delegates to the strict sheet-specific selector so application menu items
+        such as «Файл», «Правка» and «Вид» can never be selected as worksheet tabs.
+        """
+        page = self.sheet_page
+        if page is None:
+            raise RuntimeError("Страница Google Sheets недоступна.")
+
+        target = self._normalize_sheet_label(name)
+        if not target:
+            raise RuntimeError("Пустое имя листа Google Sheets.")
+
+        self._select_sheet_tab_name(target)
+        page.wait_for_timeout(600)
+
+    def _select_sheet_tab_name(self, name: str):
+        """Strictly activate a real worksheet tab, including hidden/overflowed tabs."""
+        page = self.sheet_page
+        if page is None:
+            raise RuntimeError("Страница Google Sheets недоступна.")
+        target = self._normalize_sheet_label(name)
+
+        # Visible worksheet tab.
+        if self._select_sheet_specific_element(target):
+            return
+
+        # Hidden/overflowed worksheet: use the dedicated All sheets popup.
+        if self._open_all_sheets_menu():
+            try:
+                page.wait_for_timeout(250)
+                selectors = [
+                    '.docs-sheet-tab-menu-item',
+                    '[class*="docs-sheet-tab-menu"]',
+                    '[data-sheet-id]',
+                ]
+                for selector in selectors:
+                    try:
+                        loc = page.locator(selector)
+                        count = min(loc.count(), 300)
+                        for i in range(count):
+                            item = loc.nth(i)
+                            try:
+                                if not item.is_visible():
+                                    continue
+                                label = item.get_attribute('aria-label') or item.get_attribute('data-tooltip')
+                                if not label:
+                                    if item.locator('.docs-sheet-tab-name').count():
+                                        label = item.locator('.docs-sheet-tab-name').first.text_content()
+                                    else:
+                                        label = item.inner_text()
+                                label = self._normalize_sheet_label(label)
+                                if label == target:
+                                    item.click()
+                                    page.wait_for_timeout(450)
+                                    return
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+            finally:
+                self._close_all_sheets_menu()
+
+        raise RuntimeError(
+            f"Не удалось активировать реальный лист «{name}». "
+            "Загрузка всей таблицы остановлена."
+        )
+
+    def _read_active_sheet_matrix(self) -> list[list[str]]:
+        """
+        Copies the complete contiguous table/data region of the active tab.
+        Google Sheets handles the selection; the data is read only from the
+        system Clipboard and immediately parsed into normalized pairs.
+        """
+        self._require_connection()
+        page = self.sheet_page
+        if page is None:
+            raise RuntimeError("Страница Google Sheets недоступна.")
+
+        self._goto_cell("A1")
+        page.wait_for_timeout(250)
+
+        sentinel = "__ONSOCIAL_FULL_SHEET_SENTINEL__"
+        pyperclip.copy(sentinel)
+
+        # Google Sheets: first Ctrl+A selects the current data region; a second
+        # Ctrl+A expands the selection to the whole used sheet/document region.
+        page.keyboard.press(f"{COPY_MOD}+A")
+        page.wait_for_timeout(180)
+        page.keyboard.press(f"{COPY_MOD}+A")
+        page.wait_for_timeout(220)
+        page.keyboard.press(f"{COPY_MOD}+C")
+
+        raw = ""
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            page.wait_for_timeout(200)
+            try:
+                raw = pyperclip.paste() or ""
+            except Exception:
+                raw = ""
+            if raw != sentinel:
+                break
+
+        if raw == sentinel or raw == "":
+            raise RuntimeError(
+                "Google Sheets не вернул содержимое активной вкладки в Clipboard."
+            )
+
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        matrix = [line.split("\t") for line in lines]
+        return matrix
+
+    @staticmethod
+    def _extract_pairs_from_matrix(matrix: list[list[str]]) -> set[tuple[str, str]]:
+        """
+        Extract real social+email pairs row-by-row.
+
+        A pair is created from values that occur on the SAME spreadsheet row.
+        This prevents a URL from one influencer row from being combined with an
+        email belonging to another row. When a row contains one URL and several
+        emails, all emails are paired with that URL. When it contains several
+        URLs and one email, that email is paired with all URLs. When there are
+        multiple URLs and multiple emails, nearest-column matching is used and
+        only genuinely row-local pairs are kept.
+        """
+        email_re = re.compile(
+            r"(?i)(?<![\w.+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+            r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?![\w.-])"
+        )
+        social_hosts = {
+            "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
+            "facebook.com", "fb.com", "x.com", "twitter.com",
+            "linkedin.com", "pinterest.com", "twitch.tv", "threads.net",
+            "snapchat.com", "vk.com", "vimeo.com", "telegram.me",
+            "t.me",
+        }
+        from urllib.parse import urlsplit
+        pairs: set[tuple[str, str]] = set()
+
+        def normalize_url(value: str) -> str:
+            value = str(value or "").strip()
+            if not value:
+                return ""
+            try:
+                if not re.match(r"^https?://", value, re.I):
+                    value = "https://" + value
+                parts = urlsplit(value)
+                host = (parts.hostname or "").lower().strip()
+                if host.startswith("www."):
+                    host = host[4:]
+                if not host:
+                    return ""
+                port = parts.port
+                netloc = host if not port or port in (80, 443) else f"{host}:{port}"
+                path = parts.path.rstrip("/") or ""
+                return f"https://{netloc}{path}"
+            except Exception:
+                return ""
+
+        def looks_social(value: str) -> bool:
+            try:
+                candidate = value.strip()
+                if not re.match(r"^https?://", candidate, re.I):
+                    candidate = "https://" + candidate
+                host = (urlsplit(candidate).hostname or "").lower()
+                if host.startswith("www."):
+                    host = host[4:]
+                return host in social_hosts or any(host.endswith("." + h) for h in social_hosts)
+            except Exception:
+                return False
+
+        for row in matrix:
+            row_cells = [str(c or "").strip() for c in row]
+            url_cells: list[tuple[int, str]] = []
+            email_cells: list[tuple[int, str]] = []
+
+            for col_idx, cell in enumerate(row_cells):
+                for email in email_re.findall(cell):
+                    email_cells.append((col_idx, email.lower()))
+                if looks_social(cell):
+                    u = normalize_url(cell)
+                    if u:
+                        url_cells.append((col_idx, u))
+                # Support a cell containing both URL and email or a label around a URL.
+                if not looks_social(cell):
+                    for match in re.findall(r"https?://[^\s<>]+", cell, re.I):
+                        candidate = match.rstrip(",.;)\"'")
+                        if looks_social(candidate):
+                            u = normalize_url(candidate)
+                            if u:
+                                url_cells.append((col_idx, u))
+
+            # De-duplicate values while keeping their column positions.
+            seen_urls = set()
+            urls = [(c, u) for c, u in url_cells if not (u in seen_urls or seen_urls.add(u))]
+            seen_emails = set()
+            emails = [(c, e) for c, e in email_cells if not (e in seen_emails or seen_emails.add(e))]
+            if not urls or not emails:
+                continue
+
+            if len(urls) == 1:
+                social = urls[0][1]
+                for _, email in emails:
+                    pairs.add((social, email))
+            elif len(emails) == 1:
+                email = emails[0][1]
+                for _, social in urls:
+                    pairs.add((social, email))
+            else:
+                # Multiple URLs/emails in one row: pair nearest columns. This avoids
+                # producing every possible cross-product and therefore avoids false
+                # duplicate matches across several influencers represented on one row.
+                remaining = list(emails)
+                for url_col, social in urls:
+                    nearest = min(remaining, key=lambda item: abs(item[0] - url_col))
+                    pairs.add((social, nearest[1]))
+                    remaining.remove(nearest)
+
+        return pairs
+
+    def load_all_tabs_profile_email_pairs(self) -> set[tuple[str, str]]:
+        """
+        Loads social+email combinations from every sheet tab before parsing.
+        No data is written to the spreadsheet. The returned set is intended to
+        live only for the current parser run.
+        """
+        self._require_connection()
+        original_name = self.sheet_name
+        self.log("========================================")
+        self.log("ЗАГРУЗКА ДАННЫХ ВСЕЙ ТАБЛИЦЫ")
+        self.log("Читаю все вкладки Google Sheets в память...")
+
+        tabs = self.list_sheet_tabs()
+        self.log(f"Найдено вкладок: {len(tabs)}")
+
+        all_pairs: set[tuple[str, str]] = set()
+        successful = 0
+        total_pairs_found = 0
+        total_rows_read = 0
+        try:
+            for index, tab_name in enumerate(tabs, start=1):
+                self.log(f"[{index}/{len(tabs)}] НАЧАЛО ЧТЕНИЯ ВКЛАДКИ: «{tab_name}»")
+                self._activate_sheet_tab_by_name(tab_name)
+                matrix = self._read_active_sheet_matrix()
+                rows_count = len(matrix)
+                total_rows_read += rows_count
+                self.log(
+                    f"[{index}/{len(tabs)}] Вкладка «{tab_name}»: прочитано строк/рядов: {rows_count:,}"
+                )
+                pairs = self._extract_pairs_from_matrix(matrix)
+                found_count = len(pairs)
+                total_pairs_found += found_count
+                before = len(all_pairs)
+                all_pairs.update(pairs)
+                added_unique = len(all_pairs) - before
+                successful += 1
+                self.log(
+                    f"[{index}/{len(tabs)}] Вкладка «{tab_name}»: найдено {found_count:,} пар «соцсеть + email»; "
+                    f"новых уникальных после объединения: {added_unique:,}; всего в памяти: {len(all_pairs):,}"
+                )
+
+            if successful != len(tabs):
+                raise RuntimeError(
+                    f"Прочитано только {successful} из {len(tabs)} вкладок."
+                )
+
+            duplicates_inside_tabs = max(0, total_pairs_found - len(all_pairs))
+            self.log("----------------------------------------")
+            self.log("✅ ВСЕ ДАННЫЕ ИЗ ТАБЛИЦЫ СОБРАНЫ")
+            self.log(f"Вкладок обработано: {successful}/{len(tabs)}")
+            self.log(f"Всего строк/рядов прочитано: {total_rows_read:,}")
+            self.log(f"Всего найдено пар «ссылка + email» до объединения: {total_pairs_found:,}")
+            self.log(f"Уникальных комбинаций загружено в память: {len(all_pairs):,}")
+            self.log(f"Повторяющихся комбинаций отброшено при объединении: {duplicates_inside_tabs:,}")
+            self.log("Парсер можно запускать — сравнение будет выполняться только с этой памятью.")
+            self.log("----------------------------------------")
+            return all_pairs
+        finally:
+            # Always restore the working sheet; if restoring fails, fail closed.
+            try:
+                self._activate_sheet_tab_by_name(original_name)
+            except Exception as restore_error:
+                self.log(f"Не удалось вернуть рабочую вкладку «{original_name}»: {restore_error!r}")
+                raise
+
+    # ============================================================
     # WRITE ROWS
     # ============================================================
 

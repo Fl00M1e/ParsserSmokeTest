@@ -54,3 +54,20 @@ Added `build/sign_macos.sh` and `.github/workflows/release-macos-signed.yml`.
 The release workflow imports a Developer ID Application certificate from GitHub Secrets, signs nested Mach-O payloads and the app bundle with hardened runtime + secure timestamp, validates the signature, runs the packaged self-test and real app launch on ARM64/Intel macOS runners, submits the ZIP to Apple with `notarytool`, staples the approved ticket, validates with `stapler` and `spctl`, and publishes the final notarized ZIP.
 
 The required GitHub Secrets and one-time Apple setup are documented in `README-MAC-SIGNING.md`.
+
+## Full-table preload cache for duplicate protection
+
+The duplicate check was redesigned to use an explicit preload step before parsing.
+
+### New workflow
+
+1. Connect the Google Sheet.
+2. Click **"Загрузить данные ВСЕЙ таблицы"**.
+3. The app enumerates every Google Sheets tab, including tabs reachable through the **All sheets** menu.
+4. Each tab is copied through the normal Google Sheets UI/Clipboard (no Sheets API).
+5. The app extracts and normalizes all `social URL + email` combinations and keeps only those pairs in RAM.
+6. Parsing cannot start until the preload succeeds.
+7. During parsing, every candidate profile is checked against that in-memory set; no sheet re-read is performed.
+8. At the end (including stop/error), the in-memory preload cache is cleared and the UI requires a fresh preload for the next run.
+
+The loader fails closed: if any tab cannot be read or activated, the entire preload is rejected and parsing is blocked.

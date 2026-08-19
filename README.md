@@ -107,3 +107,13 @@ GitHub Actions для macOS теперь проверяет не только а
 
 
 Если macOS после скачивания архива из GitHub сообщает, что программу нельзя открыть, это может быть не ошибка ARM64-сборки, а Gatekeeper/quarantine. Тест CI уже доказывает запуск на чистом ARM64 runner, но для публичного распространения нужен Developer ID + notarization Apple. До этого для локальной проверки можно открыть приложение через контекстное меню Finder → Open; не следует удалять файлы приложения или пересобирать его из-за одного только предупреждения Gatekeeper.
+
+## Duplicate protection: preload the whole spreadsheet
+
+Before every parser run, click **"Загрузить данные ВСЕЙ таблицы"** after connecting the spreadsheet.
+
+The app reads all tabs through the browser/Clipboard, extracts normalized social-network URL + email pairs, and keeps only those pairs in RAM for the current run. The parser then checks each discovered profile against this in-memory set and skips any profile for which a matching pair already exists.
+
+The cache is intentionally cleared after the run (normal completion, stop, or error). The next run requires a new preload, so the app does not keep the previous table snapshot between runs.
+
+If even one sheet tab cannot be enumerated/read, preload fails closed and the parser is not allowed to start.

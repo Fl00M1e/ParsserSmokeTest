@@ -115,6 +115,13 @@ class App:
         self.sheets_ready = False
         self.worker_busy = False
 
+        # Постоянный в рамках жизненного цикла приложения кэш дублей.
+        # Загружается автоматически после подключения Google Sheets,
+        # пополняется новыми записанными комбинациями и полностью
+        # очищается только при закрытии приложения.
+        self.table_cache_loaded = False
+        self.table_cache_pairs: set[tuple[str, str]] = set()
+
         # Эти объекты принадлежат Playwright worker thread.
         self.pw = None
         self.context = None
@@ -439,6 +446,36 @@ class App:
             pady=8,
         )
 
+        self.load_table_button = ttk.Button(
+            box,
+            text="Обновить данные ВСЕЙ таблицы",
+            command=self.load_table_cache,
+        )
+
+        self.load_table_button.grid(
+            row=7,
+            column=1,
+            sticky="w",
+            padx=(8, 0),
+            pady=8,
+        )
+
+        self.table_cache_status_var = tk.StringVar(
+            value="После подключения Google Sheets приложение автоматически загрузит все листы и комбинации в память."
+        )
+
+        ttk.Label(
+            box,
+            textvariable=self.table_cache_status_var,
+            wraplength=700,
+        ).grid(
+            row=8,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(2, 2),
+        )
+
         box.columnconfigure(
             0,
             weight=1,
@@ -599,8 +636,10 @@ class App:
         self.log("2. Войди в аккаунт вручную.")
         self.log("3. Открой Influencer Identification.")
         self.log("4. Подключи Google Sheets.")
-        self.log("5. Укажи начальную ячейку, например A2.")
-        self.log("6. Нажми «НАЧАТЬ».")
+        self.log("5. Нажми «Загрузить данные ВСЕЙ таблицы» — все вкладки будут прочитаны в память.")
+        self.log("6. Укажи начальную ячейку, например A2.")
+        self.log("7. Нажми «НАЧАТЬ».")
+        self.log("После завершения кэш автоматически удаляется — для нового запуска загрузите таблицу заново.")
 
     # ============================================================
     # LOG
@@ -765,6 +804,9 @@ class App:
                         self._worker_connect_sheets(
                             args,
                         )
+
+                    elif command == "load_table_cache":
+                        self._worker_load_table_cache()
 
                     elif command == "start_parser":
                         self._worker_start_parser(
@@ -1005,10 +1047,25 @@ class App:
         # --------------------------------------------------------
 
         self.sheets_ready = True
+        self.table_cache_pairs.clear()
+        self.table_cache_loaded = False
+        self.root.after(
+            0,
+            lambda: self.table_cache_status_var.set(
+                "Таблица подключена. Автоматически загружаю все листы и комбинации в память..."
+            ),
+        )
 
         self.log(
             "Google Sheets подключена."
         )
+        self.log(
+            "Автоматически загружаю ВСЮ таблицу во временную память дедупликации..."
+        )
+
+        # Автоматическая первоначальная загрузка после подключения таблицы.
+        # Повторное нажатие отдельной кнопки остаётся доступным для ручного обновления.
+        self.root.after(200, self.load_table_cache)
 
         self.log(
             f"Лист: {sheet_name}"
@@ -1025,6 +1082,74 @@ class App:
             self.log(
                 "Возвращаюсь в ON Social."
             )
+
+    # ============================================================
+    # LOAD FULL TABLE — WORKER
+    # ============================================================
+
+    def _worker_load_table_cache(self):
+        if not self.context:
+            raise RuntimeError("Сначала нажми «1. Открыть ON Social».")
+        if not self.sheets:
+            raise RuntimeError("Сначала подключи Google Sheets.")
+
+        self.table_cache_pairs.clear()
+        self.table_cache_loaded = False
+        self.worker_busy = True
+        self.root.after(
+            0,
+            lambda: self.table_cache_status_var.set(
+                "Загрузка всех вкладок... запуск парсера заблокирован."
+            ),
+        )
+
+        try:
+            pairs = self.sheets.load_all_tabs_profile_email_pairs()
+            if not pairs:
+                raise RuntimeError(
+                    "Во всей таблице не найдено ни одной комбинации «ссылка на соцсеть + email». "
+                    "Проверь структуру таблицы."
+                )
+
+            self.table_cache_pairs = {
+                (
+                    OnSocialParser.normalize_social_url(social),
+                    OnSocialParser.normalize_email(email),
+                )
+                for social, email in pairs
+                if social and email
+            }
+            self.table_cache_loaded = True
+
+            count = len(self.table_cache_pairs)
+            self.root.after(
+                0,
+                lambda c=count: self.table_cache_status_var.set(
+                    f"Память дедупликации загружена: {c:,} комбинаций. "
+                    "Теперь можно нажимать «НАЧАТЬ»."
+                ),
+            )
+            self.log(
+                "✅ КЭШ ТАБЛИЦЫ УСПЕШНО ЗАГРУЖЕН В ПАМЯТЬ"
+            )
+            self.log(
+                f"Собрано и сохранено для сравнения: {count:,} уникальных комбинаций «ссылка + email»."
+            )
+            self.log(
+                "Эти данные живут до закрытия приложения и пополняются каждой новой успешно записанной комбинацией."
+            )
+            self.worker_busy = False
+        except Exception:
+            self.table_cache_pairs.clear()
+            self.table_cache_loaded = False
+            self.worker_busy = False
+            self.root.after(
+                0,
+                lambda: self.table_cache_status_var.set(
+                    "Загрузка НЕ выполнена. Нужна повторная загрузка всей таблицы."
+                ),
+            )
+            raise
 
     # ============================================================
     # START PARSER — WORKER
@@ -1066,47 +1191,25 @@ class App:
         )
 
         # ------------------------------------------------------
-        # ДЕДУПЛИКАЦИЯ ПО ТАБЛИЦЕ
-        #
-        # Подгружаем существующие комбинации «ссылка на соцсеть + email»,
-        # чтобы полностью повторную запись пропустить даже после
-        # предыдущих запусков приложения или ручного добавления в таблицу.
+        # ДЕДУПЛИКАЦИЯ: используем только заранее загруженный
+        # пользователем кэш ВСЕЙ таблицы и ВСЕХ вкладок.
+        # Никакого повторного чтения таблицы во время запуска.
         # ------------------------------------------------------
 
-        try:
-
-            existing_pairs = self.sheets.read_existing_profile_email_pairs()
-
-            for social_url, email in existing_pairs:
-                parser.processed_profile_email_pairs.add(
-                    (
-                        parser.normalize_social_url(social_url),
-                        parser.normalize_email(email),
-                    )
-                )
-
-            self.log(
-                f"Дедупликация таблицы загружена: "
-                f"{len(existing_pairs)} пар «соцсеть + email»."
-            )
-
-        except Exception as e:
-
-            self.log(
-                "КРИТИЧЕСКАЯ ОШИБКА ДЕДУПЛИКАЦИИ: "
-                f"{e!r}"
-            )
-
-            self.log(
-                "Останавливаю запуск. Нельзя продолжать обработку, "
-                "пока таблица не прочитана: иначе бот может записать "
-                "уже существующих инфлюенсеров повторно."
-            )
-
+        if not self.table_cache_loaded or not self.table_cache_pairs:
             raise RuntimeError(
-                "Не удалось прочитать Google Sheets для проверки дублей. "
-                "Запуск остановлен намеренно."
-            ) from e
+                "Перед запуском нужно нажать «Загрузить данные ВСЕЙ таблицы». "
+                "Без предварительно загруженного кэша запуск запрещён."
+            )
+
+        parser.processed_profile_email_pairs.update(
+            self.table_cache_pairs
+        )
+
+        self.log(
+            f"Использую предварительно загруженный кэш: "
+            f"{len(self.table_cache_pairs)} уникальных пар «соцсеть + email»."
+        )
 
         processed = 0
         unlocks = 0
@@ -1364,6 +1467,32 @@ class App:
                         rows,
                     )
 
+                    # ------------------------------------------------
+                    # После успешной записи сразу добавляем новые
+                    # комбинации «соцсеть + email» в память.
+                    # Это предотвращает повторную запись того же
+                    # инфлюенсера в следующем цикле/прогоне.
+                    # ------------------------------------------------
+                    added_to_cache = 0
+                    for row in rows:
+                        social = str(row[1] or "").strip() if len(row) > 1 else ""
+                        email = str(row[2] or "").strip() if len(row) > 2 else ""
+                        if not social or not email:
+                            continue
+                        key = (
+                            OnSocialParser.normalize_social_url(social),
+                            OnSocialParser.normalize_email(email),
+                        )
+                        if key[0] and key[1] and key not in self.table_cache_pairs:
+                            self.table_cache_pairs.add(key)
+                            parser.processed_profile_email_pairs.add(key)
+                            added_to_cache += 1
+
+                    self.log(
+                        f"КЭШ ДЕДУПЛИКАЦИИ ОБНОВЛЁН: добавлено новых комбинаций «ссылка + email»: {added_to_cache}. "
+                        f"Всего теперь в памяти: {len(self.table_cache_pairs):,}."
+                    )
+
                     processed += 1
 
                     self.log(
@@ -1462,6 +1591,24 @@ class App:
             )
 
         finally:
+
+            # --------------------------------------------------
+            # КЭШ НЕ ОЧИЩАЕМ ПОСЛЕ ОДНОГО ПРОГОНА.
+            # Он живёт до закрытия приложения и уже содержит
+            # комбинации, которые бот добавил в таблицу.
+            # --------------------------------------------------
+            current_cache_count = len(self.table_cache_pairs)
+            self.root.after(
+                0,
+                lambda c=current_cache_count: self.table_cache_status_var.set(
+                    f"Кэш дедупликации активен: {c:,} уникальных комбинаций. "
+                    "После закрытия приложения кэш будет полностью удалён."
+                ),
+            )
+
+            self.log(
+                f"Парсер завершён. Кэш НЕ удалён: в памяти осталось {current_cache_count:,} уникальных комбинаций."
+            )
 
             self.stop_event.clear()
 
@@ -1636,6 +1783,35 @@ class App:
             pass
 
     # ============================================================
+    # LOAD FULL TABLE CACHE
+    # ============================================================
+
+    def load_table_cache(self):
+        if not self.browser_ready:
+            messagebox.showwarning(
+                "Браузер",
+                "Сначала нажми «1. Открыть ON Social».",
+            )
+            return
+
+        if not self.sheets_ready:
+            messagebox.showwarning(
+                "Google Sheets",
+                "Сначала нажми «Подключить Google Sheets».",
+            )
+            return
+
+        if self.worker_busy:
+            messagebox.showwarning(
+                "Парсер работает",
+                "Нельзя менять кэш таблицы во время обработки.",
+            )
+            return
+
+        self.log("Запрашиваю полную загрузку таблицы перед стартом...")
+        self._queue_command("load_table_cache")
+
+    # ============================================================
     # START
     # ============================================================
 
@@ -1657,6 +1833,15 @@ class App:
                 "Сначала подключи Google Sheets.",
             )
 
+            return
+
+        if not self.table_cache_loaded or not self.table_cache_pairs:
+            messagebox.showwarning(
+                "Данные таблицы не загружены",
+                "Подожди, пока после подключения Google Sheets завершится автоматическая загрузка всей таблицы в память.\n\n"
+                "Кэш загружается один раз при подключении таблицы, затем пополняется новыми записанными комбинациями.\n"
+                "Он будет полностью удалён только при закрытии приложения.",
+            )
             return
 
         if self.worker_busy:
@@ -1845,6 +2030,8 @@ class App:
 
             self.stop_event.set()
 
+        # Только даём worker завершиться; кэш удаляем в _finish_close,
+        # когда worker уже гарантированно остановлен.
         self.worker_shutdown.set()
 
         self.command_queue.put(
@@ -1875,10 +2062,17 @@ class App:
         except Exception:
             pass
 
+        # Полностью очищаем временную память только сейчас, когда
+        # worker уже завершён и больше не использует кэш.
+        cleared_count = len(self.table_cache_pairs)
+        self.table_cache_pairs.clear()
+        self.table_cache_loaded = False
+        self.log(
+            f"ПРИЛОЖЕНИЕ ЗАКРЫТО: удалены данные дедупликации из памяти ({cleared_count:,} комбинаций)."
+        )
+
         try:
-
             self.root.destroy()
-
         except Exception:
             pass
 
