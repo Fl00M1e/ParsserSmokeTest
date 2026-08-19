@@ -63,14 +63,14 @@ class OnSocialParser:
         # ====================================================
         # ВАЖНО:
         #
-        # Здесь храним уже обработанные профили.
-        #
-        # Даже если ON Social оставит старую кнопку Analyze
-        # после физического клика, бот второй раз этот профиль
-        # обрабатывать не будет.
+        # processed_profiles защищает только от повторного клика
+        # по одной и той же кнопке Analyze внутри текущей сессии.
+        # Проверка «есть ли уже запись в таблице» выполняется
+        # отдельно и именно по паре «соцсеть + email».
         # ====================================================
 
         self.processed_profiles: set[str] = set()
+        self.processed_profile_email_pairs: set[tuple[str, str]] = set()
 
     # ========================================================
     # BASIC
@@ -256,6 +256,77 @@ class OnSocialParser:
                 return True
 
         return False
+
+    @staticmethod
+    def normalize_social_url(value: str) -> str:
+        from urllib.parse import urlsplit, urlunsplit
+
+        value = (value or "").strip()
+        if not value:
+            return ""
+
+        try:
+            parts = urlsplit(value)
+            if not parts.netloc:
+                return value.rstrip("/").lower()
+
+            scheme = parts.scheme.lower()
+            hostname = (parts.hostname or "").lower()
+            port = parts.port
+            netloc = hostname
+
+            if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+                netloc = f"{hostname}:{port}"
+
+            path = parts.path.rstrip("/") or ""
+            return urlunsplit((scheme, netloc, path, "", ""))
+        except Exception:
+            return value.rstrip("/").lower()
+
+    @staticmethod
+    def normalize_email(value: str) -> str:
+        return re.sub(r"\s+", "", (value or "").strip()).lower()
+
+    def profile_has_existing_email_pair(
+        self,
+        social_url: str,
+        emails: list[str],
+    ) -> bool:
+        """
+        Возвращает True, если хотя бы одна комбинация
+        «social_url + email» уже встречается среди записей,
+        загруженных из Google Sheets или созданных в текущем
+        запуске.
+
+        Профиль тогда пропускается целиком и бот переходит
+        к следующему Analyze.
+        """
+        social = self.normalize_social_url(social_url)
+        candidates = emails or [""]
+
+        for email in candidates:
+            key = (social, self.normalize_email(email))
+            if key in self.processed_profile_email_pairs:
+                return True
+
+        return False
+
+    def mark_processed_email_pairs(
+        self,
+        social_url: str,
+        emails: list[str],
+    ):
+        social = self.normalize_social_url(social_url)
+        candidates = emails or [""]
+
+        for email in candidates:
+            self.processed_profile_email_pairs.add(
+                (social, self.normalize_email(email))
+            )
+
+        self.log(
+            f"Сохранены комбинации «соцсеть + email»: {len(candidates)}"
+        )
 
     # ========================================================
     # ANALYZE SEARCH

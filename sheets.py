@@ -475,7 +475,133 @@ class GoogleSheetsWriter:
         )
 
     # ============================================================
-    # ЧТЕНИЕ УЖЕ СУЩЕСТВУЮЩИХ ССЫЛОК (ДЛЯ ДЕДУПЛИКАЦИИ)
+    # ДЕДУПЛИКАЦИЯ ПО ПАРЕ «СОЦСЕТЬ + EMAIL»
+    # ============================================================
+
+    @staticmethod
+    def normalize_social_url(value: str) -> str:
+        """
+        Нормализует ссылку на соцсеть для сравнения.
+
+        Убираем пробелы, fragment/query и финальный slash,
+        но не меняем путь профиля агрессивно, чтобы не склеить
+        потенциально разные URL.
+        """
+        from urllib.parse import urlsplit, urlunsplit
+
+        value = (value or "").strip()
+        if not value:
+            return ""
+
+        try:
+            parts = urlsplit(value)
+            if not parts.netloc:
+                return value.rstrip("/").lower()
+
+            scheme = parts.scheme.lower()
+            hostname = (parts.hostname or "").lower()
+            port = parts.port
+
+            netloc = hostname
+            if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+                netloc = f"{hostname}:{port}"
+
+            path = parts.path.rstrip("/") or ""
+            return urlunsplit((scheme, netloc, path, "", ""))
+        except Exception:
+            return value.rstrip("/").lower()
+
+    @staticmethod
+    def normalize_email(value: str) -> str:
+        return re.sub(r"\s+", "", (value or "").strip()).lower()
+
+    @classmethod
+    def make_profile_email_key(cls, social_url: str, email: str) -> tuple[str, str]:
+        return (
+            cls.normalize_social_url(social_url),
+            cls.normalize_email(email),
+        )
+
+    def _read_whole_column(self, column: int) -> list[str]:
+        self._require_connection()
+
+        page = self.sheet_page
+        if page is None:
+            return []
+
+        top_cell = self._cell_to_string(column, 1)
+
+        self._goto_cell(top_cell)
+        page.keyboard.press(f"{MOD}+Space")
+        page.wait_for_timeout(300)
+        page.keyboard.press(f"{MOD}+C")
+        page.wait_for_timeout(300)
+
+        raw = pyperclip.paste() or ""
+        return raw.splitlines()
+
+    def read_existing_profile_email_pairs(self) -> set[tuple[str, str]]:
+        """
+        Читает из таблицы пары «ссылка на соцсеть + email».
+
+        append_rows() пишет их в две соседние колонки:
+            start_cell     -> имя
+            start_cell + 1 -> social_url
+            start_cell + 2 -> email
+
+        Дедупликация теперь выполняется именно по этой паре,
+        а не только по ссылке на соцсеть. Это позволяет отличить
+        одного и того же инфлюенсера с новым email от полностью
+        идентичной записи.
+        """
+
+        url_column = self.current_column + 1
+        email_column = self.current_column + 2
+
+        self.log(
+            "Google Sheets: читаю существующие пары "
+            "«соцсеть + email»..."
+        )
+
+        try:
+            urls = self._read_whole_column(url_column)
+            emails = self._read_whole_column(email_column)
+        except Exception as e:
+            self.log(
+                "Не удалось прочитать существующие пары "
+                f"из таблицы: {e!r}. Дедупликация по таблице "
+                "в этом запуске работать не будет."
+            )
+            return set()
+
+        pairs: set[tuple[str, str]] = set()
+        row_count = max(len(urls), len(emails))
+
+        for index in range(row_count):
+            social_url = urls[index].strip() if index < len(urls) else ""
+            email = emails[index].strip() if index < len(emails) else ""
+
+            # Строка без соцсети не может идентифицировать
+            # профиль, поэтому её игнорируем.
+            if not social_url:
+                continue
+
+            pairs.add(
+                self.make_profile_email_key(
+                    social_url,
+                    email,
+                )
+            )
+
+        self.log(
+            "Google Sheets: найдено существующих пар "
+            f"«соцсеть + email»: {len(pairs)}"
+        )
+
+        return pairs
+
+    # ============================================================
+    # ОБРАТНАЯ СОВМЕСТИМОСТЬ: ЧТЕНИЕ ТОЛЬКО ССЫЛОК
     # ============================================================
 
     def read_existing_social_urls(self) -> set[str]:

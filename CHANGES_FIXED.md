@@ -47,3 +47,10 @@ This tests actual application startup on the ARM64 macOS runner instead of only 
 Также отдельно проверяется архитектура Playwright driver, а `codesign` и `spctl` записываются в диагностические файлы.
 
 Дублирующий macOS job удалён из `build.yml`: macOS теперь собирается и тестируется только в `.github/workflows/build-macos.yml`, чтобы результаты не путались.
+
+## Developer ID signing + notarization
+
+Added `build/sign_macos.sh` and `.github/workflows/release-macos-signed.yml`.
+The release workflow imports a Developer ID Application certificate from GitHub Secrets, signs nested Mach-O payloads and the app bundle with hardened runtime + secure timestamp, validates the signature, runs the packaged self-test and real app launch on ARM64/Intel macOS runners, submits the ZIP to Apple with `notarytool`, staples the approved ticket, validates with `stapler` and `spctl`, and publishes the final notarized ZIP.
+
+The required GitHub Secrets and one-time Apple setup are documented in `README-MAC-SIGNING.md`.
