@@ -10,19 +10,14 @@ from playwright.sync_api import BrowserContext, Page
 
 
 # ============================================================
-# КРОСС-ПЛАТФОРМЕННЫЕ ХОТКЕИ
+# GOOGLE SHEETS HOTKEYS
 # ============================================================
-#
-# На Windows/Linux системная клавиша-модификатор для
-# копирования/вставки/выделения — Control.
-# На macOS браузер (в т.ч. управляемый Playwright) ожидает
-# Cmd (в терминах Playwright это "Meta"), Control там ничего
-# не делает.
-#
-# MOD задаётся один раз при импорте модуля и используется
-# везде вместо жёстко зашитого "Control".
+# Cmd+Space на macOS — системный Spotlight, поэтому для выбора
+# колонки Google Sheets всегда используем Control+Space.
+# Копирование/вставка используют Cmd на macOS и Ctrl на Windows.
 
-MOD = "Meta" if sys.platform == "darwin" else "Control"
+COPY_MOD = "Meta" if sys.platform == "darwin" else "Control"
+COLUMN_SELECT_MOD = "Control"
 
 
 class GoogleSheetsWriter:
@@ -437,7 +432,7 @@ class GoogleSheetsWriter:
         # Вставляем.
         # --------------------------------------------------------
 
-        page.keyboard.press(f"{MOD}+V")
+        page.keyboard.press(f"{COPY_MOD}+V")
 
         # --------------------------------------------------------
         # Даём Sheets обработать вставку.
@@ -480,13 +475,7 @@ class GoogleSheetsWriter:
 
     @staticmethod
     def normalize_social_url(value: str) -> str:
-        """
-        Нормализует ссылку на соцсеть для сравнения.
-
-        Убираем пробелы, fragment/query и финальный slash,
-        но не меняем путь профиля агрессивно, чтобы не склеить
-        потенциально разные URL.
-        """
+        """Нормализует URL соцсети для надёжного сравнения."""
         from urllib.parse import urlsplit, urlunsplit
 
         value = (value or "").strip()
@@ -498,16 +487,19 @@ class GoogleSheetsWriter:
             if not parts.netloc:
                 return value.rstrip("/").lower()
 
-            scheme = parts.scheme.lower()
-            hostname = (parts.hostname or "").lower()
-            port = parts.port
+            hostname = (parts.hostname or "").lower().strip()
+            if hostname.startswith("www."):
+                hostname = hostname[4:]
 
+            port = parts.port
             netloc = hostname
-            if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+            if port and port not in (80, 443):
                 netloc = f"{hostname}:{port}"
 
             path = parts.path.rstrip("/") or ""
-            return urlunsplit((scheme, netloc, path, "", ""))
+
+            # Схему приводим к https, query и fragment игнорируем.
+            return urlunsplit(("https", netloc, path, "", ""))
         except Exception:
             return value.rstrip("/").lower()
 
@@ -523,22 +515,56 @@ class GoogleSheetsWriter:
         )
 
     def _read_whole_column(self, column: int) -> list[str]:
+        """Надёжно читает одну колонку Google Sheets через UI и Clipboard."""
         self._require_connection()
 
         page = self.sheet_page
         if page is None:
-            return []
+            raise RuntimeError("Страница Google Sheets недоступна.")
 
         top_cell = self._cell_to_string(column, 1)
-
         self._goto_cell(top_cell)
-        page.keyboard.press(f"{MOD}+Space")
-        page.wait_for_timeout(300)
-        page.keyboard.press(f"{MOD}+C")
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(400)
 
-        raw = pyperclip.paste() or ""
-        return raw.splitlines()
+        # В Google Sheets выбор колонки — Control+Space даже на macOS.
+        page.keyboard.press(f"{COLUMN_SELECT_MOD}+Space")
+        page.wait_for_timeout(500)
+
+        sentinel = "__ONSOCIAL_SHEETS_CLIPBOARD_SENTINEL__"
+        try:
+            pyperclip.copy(sentinel)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось подготовить Clipboard: {e!r}")
+
+        page.keyboard.press(f"{COPY_MOD}+C")
+
+        raw = ""
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            page.wait_for_timeout(200)
+            try:
+                raw = pyperclip.paste() or ""
+            except Exception:
+                raw = ""
+            if raw != sentinel:
+                break
+
+        if raw == sentinel or raw == "":
+            raise RuntimeError(
+                f"Google Sheets не вернул данные Clipboard для колонки "
+                f"{self._column_to_letters(column)}. "
+                "Проверка дублей остановлена, чтобы не допустить повторную запись."
+            )
+
+        values = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        while values and not values[-1].strip():
+            values.pop()
+
+        self.log(
+            f"Google Sheets: прочитана колонка {self._column_to_letters(column)} — "
+            f"{len(values)} строк."
+        )
+        return values
 
     def read_existing_profile_email_pairs(self) -> set[tuple[str, str]]:
         """
@@ -568,11 +594,14 @@ class GoogleSheetsWriter:
             emails = self._read_whole_column(email_column)
         except Exception as e:
             self.log(
-                "Не удалось прочитать существующие пары "
-                f"из таблицы: {e!r}. Дедупликация по таблице "
-                "в этом запуске работать не будет."
+                "КРИТИЧЕСКАЯ ОШИБКА: не удалось прочитать существующие "
+                f"пары из Google Sheets: {e!r}. Останавливаю обработку, "
+                "чтобы не допустить записи дублей."
             )
-            return set()
+            raise RuntimeError(
+                "Не удалось безопасно прочитать Google Sheets для дедупликации. "
+                "Запись остановлена, чтобы не создавать дубликаты."
+            ) from e
 
         pairs: set[tuple[str, str]] = set()
         row_count = max(len(urls), len(emails))
@@ -726,7 +755,7 @@ class GoogleSheetsWriter:
                         item.click()
 
                         page.keyboard.press(
-                            f"{MOD}+A"
+                            f"{COPY_MOD}+A"
                         )
 
                         page.keyboard.type(
@@ -759,13 +788,13 @@ class GoogleSheetsWriter:
 
         try:
             page.keyboard.press(
-                f"{MOD}+J"
+                f"{COLUMN_SELECT_MOD}+J"
             )
 
             page.wait_for_timeout(300)
 
             page.keyboard.press(
-                f"{MOD}+A"
+                f"{COPY_MOD}+A"
             )
 
             page.keyboard.type(

@@ -292,21 +292,21 @@ class OnSocialParser:
         social_url: str,
         emails: list[str],
     ) -> bool:
-        """
-        Возвращает True, если хотя бы одна комбинация
-        «social_url + email» уже встречается среди записей,
-        загруженных из Google Sheets или созданных в текущем
-        запуске.
-
-        Профиль тогда пропускается целиком и бот переходит
-        к следующему Analyze.
-        """
+        """True, если хотя бы одна реальная пара social URL + email уже есть."""
         social = self.normalize_social_url(social_url)
-        candidates = emails or [""]
+        if not social:
+            return False
 
-        for email in candidates:
-            key = (social, self.normalize_email(email))
+        for email in (emails or []):
+            normalized_email = self.normalize_email(email)
+            if not normalized_email:
+                continue
+
+            key = (social, normalized_email)
             if key in self.processed_profile_email_pairs:
+                self.log(
+                    f"Найдена существующая пара: {social} + {normalized_email}"
+                )
                 return True
 
         return False
@@ -317,15 +317,21 @@ class OnSocialParser:
         emails: list[str],
     ):
         social = self.normalize_social_url(social_url)
-        candidates = emails or [""]
+        if not social:
+            return
 
-        for email in candidates:
+        count = 0
+        for email in (emails or []):
+            normalized_email = self.normalize_email(email)
+            if not normalized_email:
+                continue
             self.processed_profile_email_pairs.add(
-                (social, self.normalize_email(email))
+                (social, normalized_email)
             )
+            count += 1
 
         self.log(
-            f"Сохранены комбинации «соцсеть + email»: {len(candidates)}"
+            f"Сохранены комбинации «соцсеть + email»: {count}"
         )
 
     # ========================================================
