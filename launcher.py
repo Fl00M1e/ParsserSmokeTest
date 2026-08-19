@@ -44,6 +44,11 @@ def _show_error(message: str) -> None:
 
 
 def main() -> None:
+    if "--self-test" in sys.argv[1:]:
+        from selftest import main as self_test_main
+
+        raise SystemExit(self_test_main())
+
     try:
         from app import main as app_main
 

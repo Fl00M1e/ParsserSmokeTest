@@ -36,3 +36,14 @@ The workflow:
 - terminates only the ParserOnSocial process before the job continues/finishes.
 
 This tests actual application startup on the ARM64 macOS runner instead of only testing that an ARM64 executable exists.
+
+## Дополнительный macOS smoke/self-test
+
+В macOS workflow добавлена двухступенчатая проверка:
+
+1. запускается упакованный бинарник с `--self-test` и проверяется Python runtime, импорт модулей, writable Application Support, Playwright driver и реальный запуск persistent Chrome через `channel="chrome"`;
+2. затем запускается именно `.app` через macOS Launch Services (`open`), как это делает обычный пользователь, и проверяется, что процесс остаётся живым.
+
+Также отдельно проверяется архитектура Playwright driver, а `codesign` и `spctl` записываются в диагностические файлы.
+
+Дублирующий macOS job удалён из `build.yml`: macOS теперь собирается и тестируется только в `.github/workflows/build-macos.yml`, чтобы результаты не путались.

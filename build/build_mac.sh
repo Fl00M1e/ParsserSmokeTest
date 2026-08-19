@@ -74,6 +74,18 @@ fi
 
 chmod +x "$DRIVER"
 
+echo "--- Playwright driver architecture ---"
+file "$DRIVER"
+DRIVER_ARCHS="$(lipo -archs "$DRIVER" 2>/dev/null || true)"
+if [[ -z "$DRIVER_ARCHS" ]]; then
+    echo "ERROR: Playwright driver is not a readable Mach-O executable: $DRIVER" >&2
+    exit 1
+fi
+if [[ "$DRIVER_ARCHS" != *"$MAC_ARCH"* ]]; then
+    echo "ERROR: Playwright driver architecture mismatch. Expected $MAC_ARCH, got: $DRIVER_ARCHS" >&2
+    exit 1
+fi
+
 # PyInstaller already signs collected macOS binaries ad-hoc. Re-signing
 # the whole bundle gives us a clean, consistent final signature.
 codesign --force --deep --sign - "$APP"

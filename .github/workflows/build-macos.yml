@@ -46,14 +46,28 @@ jobs:
         run: |
           APP="build/dist/ParserOnSocial.app"
           BIN="$APP/Contents/MacOS/ParserOnSocial"
+          DRIVER="$APP/Contents/Frameworks/playwright/driver/node"
           test -x "$BIN"
+          test -x "$DRIVER"
+          echo "Main executable:"
+          file "$BIN"
+          echo "Main architectures:"
           lipo -archs "$BIN"
+          echo "Playwright driver:"
+          file "$DRIVER"
+          echo "Playwright driver architectures:"
+          lipo -archs "$DRIVER"
           codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --display --verbose=4 "$APP" 2>&1 | tee build/codesign-info.txt || true
+          spctl --assess --type execute --verbose=4 "$APP" 2>&1 | tee build/spctl-assessment.txt || true
+          xattr -lr "$APP" 2>&1 | tee build/xattr.txt || true
 
           if [[ "${{ matrix.arch }}" == "arm64" ]]; then
             lipo -archs "$BIN" | grep -qw arm64
+            lipo -archs "$DRIVER" | grep -qw arm64
           else
             lipo -archs "$BIN" | grep -qw x86_64
+            lipo -archs "$DRIVER" | grep -qw x86_64
           fi
 
       - name: Add first-run instructions
@@ -74,6 +88,24 @@ jobs:
           Профиль Chrome и данные авторизации хранятся вне .app:
           ~/Library/Application Support/OnSocialLocalParser/browser_profile
           EOF
+
+      - name: Smoke test — packaged runtime and Playwright/Chrome
+        shell: bash
+        run: |
+          set -u
+          APP="$PWD/build/dist/ParserOnSocial.app"
+          BIN="$APP/Contents/MacOS/ParserOnSocial"
+          LOG_DIR="$PWD/build/smoke-test"
+          mkdir -p "$LOG_DIR"
+
+          echo "Running packaged self-test: $BIN --self-test" | tee "$LOG_DIR/selftest.txt"
+          echo "Runner: $(uname -m)" | tee -a "$LOG_DIR/selftest.txt"
+          echo "Binary architectures: $(lipo -archs "$BIN")" | tee -a "$LOG_DIR/selftest.txt"
+
+          if ! "$BIN" --self-test 2>&1 | tee -a "$LOG_DIR/selftest.txt"; then
+            echo "ERROR: packaged self-test failed." | tee -a "$LOG_DIR/selftest.txt"
+            exit 1
+          fi
 
       - name: Smoke test — launch the real .app
         shell: bash
@@ -107,6 +139,9 @@ jobs:
 
           ps auxww | grep -F "ParserOnSocial" | grep -v grep | tee "$LOG_DIR/processes.txt" || true
           log show --style compact --last 90s --predicate 'process == "ParserOnSocial"' 2>&1 | tee "$LOG_DIR/macos-log.txt" || true
+          otool -L "$BIN" 2>&1 | tee "$LOG_DIR/otool-main.txt" || true
+          otool -L "$APP/Contents/Frameworks/playwright/driver/node" 2>&1 | tee "$LOG_DIR/otool-playwright-driver.txt" || true
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -iname '*ParserOnSocial*' -print -exec tail -200 {} \; 2>/dev/null | tee "$LOG_DIR/crash-reports.txt" || true
 
           if [[ "$running" -ne 1 ]]; then
             echo "ERROR: ParserOnSocial.app did not stay running after launch." | tee -a "$LOG_DIR/launch.txt"

@@ -6,54 +6,6 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build-macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-15
-            arch_label: arm64
-          - runner: macos-15-intel
-            arch_label: x86_64
-
-    runs-on: ${{ matrix.runner }}
-    env:
-      MAC_ARCH: ${{ matrix.arch_label }}
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Build .app
-        run: |
-          chmod +x build/build_mac.sh
-          build/build_mac.sh
-
-      - name: Validate final app
-        run: |
-          APP="build/dist/ParserOnSocial.app"
-          BIN="$APP/Contents/MacOS/ParserOnSocial"
-          test -x "$BIN"
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          lipo -archs "$BIN"
-          lipo -archs "$BIN" | grep -qw "${{ matrix.arch_label }}"
-
-      - name: Zip app bundle
-        run: |
-          cd build/dist
-          ditto -c -k --sequesterRsrc --keepParent ParserOnSocial.app ParserOnSocial-mac-${{ matrix.arch_label }}.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ParserOnSocial-mac-${{ matrix.arch_label }}
-          path: build/dist/ParserOnSocial-mac-${{ matrix.arch_label }}.zip
-
   build-windows:
     runs-on: windows-latest
 

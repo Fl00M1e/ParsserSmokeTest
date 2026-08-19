@@ -44,6 +44,7 @@ a = Analysis(
     datas=driver_datas,
     hiddenimports=[
         "playwright.sync_api",
+        "selftest",
     ],
     hookspath=[],
     hooksconfig={},
