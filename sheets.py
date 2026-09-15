@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import csv
+import io
 import re
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
+from dedup import extract_pairs, filter_new_rows, normalize_social_url, normalize_email
 from typing import Iterable, Optional
 
 import pyperclip
@@ -19,6 +23,10 @@ from playwright.sync_api import BrowserContext, Page
 
 COPY_MOD = "Meta" if sys.platform == "darwin" else "Control"
 COLUMN_SELECT_MOD = "Control"
+
+
+class SheetsSafetyError(RuntimeError):
+    """A sheet operation cannot safely continue without a fresh snapshot."""
 
 
 class GoogleSheetsWriter:
@@ -62,6 +70,8 @@ class GoogleSheetsWriter:
 
         self.sheet_page: Optional[Page] = None
         self.connected = False
+        self.write_blocked = False
+        self.verified_pairs: set[tuple[str, str]] = set()
 
         # --------------------------------------------------------
         # Начальная позиция записи.
@@ -612,6 +622,140 @@ class GoogleSheetsWriter:
             "Загрузка всей таблицы остановлена."
         )
 
+    def _get_sheet_gid_by_name(self, name: str) -> str:
+        """Return the current worksheet gid using several robust fallbacks.
+
+        Google Sheets changes its internal tab DOM frequently. The previous
+        implementation depended on a ``data-sheet-id`` attribute that is not
+        present in some Chrome/Sheets builds. After activating the target sheet,
+        the most reliable public signal is the ``#gid=...`` fragment in the
+        current Sheets URL. We also keep DOM attribute fallbacks for versions
+        where that fragment is not updated synchronously.
+        """
+        page = self.sheet_page
+        if page is None:
+            raise RuntimeError("Страница Google Sheets недоступна.")
+
+        target = self._normalize_sheet_label(name)
+
+        # 1) The selected sheet is reflected in the page URL as #gid=<id>.
+        try:
+            page.wait_for_timeout(300)
+            current_url = page.url or ""
+            match = re.search(r"(?:#|[?&])gid=(\d+)", current_url)
+            if match:
+                gid = match.group(1)
+                self.log(
+                    f"Google Sheets: gid листа «{target}» определён из URL: {gid}."
+                )
+                return gid
+        except Exception:
+            pass
+
+        def scan(selector: str) -> Optional[str]:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 300)
+                for i in range(count):
+                    item = loc.nth(i)
+                    try:
+                        if not item.is_visible():
+                            continue
+                        label = None
+                        if item.locator('.docs-sheet-tab-name').count():
+                            label = item.locator('.docs-sheet-tab-name').first.text_content()
+                        label = label or item.get_attribute('data-tooltip') or item.get_attribute('aria-label') or item.inner_text()
+                        label = self._normalize_sheet_label(label)
+                        if label != target:
+                            continue
+                        for attr in (
+                            'data-sheet-id', 'data-id', 'data-sheet-id-value',
+                            'data-sheetid', 'data-gid',
+                        ):
+                            gid = item.get_attribute(attr)
+                            if gid and str(gid).strip().isdigit():
+                                return str(gid).strip()
+                    except Exception:
+                        continue
+            except Exception:
+                return None
+            return None
+
+        # 2) Visible worksheet tab DOM fallbacks.
+        for selector in ('.docs-sheet-tab', '[class*="docs-sheet-tab"]'):
+            gid = scan(selector)
+            if gid:
+                self.log(
+                    f"Google Sheets: gid листа «{target}» определён из DOM: {gid}."
+                )
+                return gid
+
+        # 3) Overflow/hidden sheet via All Sheets menu.
+        if self._open_all_sheets_menu():
+            try:
+                page.wait_for_timeout(250)
+                for selector in (
+                    '.docs-sheet-tab-menu-item',
+                    '[data-sheet-id]',
+                    '[class*="docs-sheet-tab-menu"]',
+                ):
+                    gid = scan(selector)
+                    if gid:
+                        self.log(
+                            f"Google Sheets: gid листа «{target}» определён из меню: {gid}."
+                        )
+                        return gid
+            finally:
+                self._close_all_sheets_menu()
+
+        raise RuntimeError(
+            f"Не удалось определить gid листа «{name}» даже после активации листа. "
+            "Чтение Google Sheets остановлено."
+        )
+
+    def _read_active_sheet_matrix_via_export(self, sheet_name: str) -> list[list[str]]:
+        """Read a CSV snapshot; HTML, failed requests and ambiguous formats fail closed."""
+        self._require_connection()
+        page = self.sheet_page
+        expected = f"/spreadsheets/d/{self.spreadsheet_id}/"
+        parts = urlsplit(page.url)
+        if parts.scheme != "https" or parts.hostname != "docs.google.com" or not parts.path.startswith(expected):
+            raise SheetsSafetyError("Открыта другая таблица или страница входа Google.")
+        page.bring_to_front()
+        self._activate_sheet_tab_by_name(sheet_name)
+        gid = self._get_sheet_gid_by_name(sheet_name)
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/export"
+            f"?format=csv&gid={gid}&_onsocial={time.time_ns()}"
+        )
+        response = None
+        try:
+            response = self.browser_context.request.get(
+                url, timeout=30000, headers={"Cache-Control": "no-cache"}
+            )
+            media_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if response.status != 200 or media_type not in {
+                "text/csv", "application/csv", "application/vnd.ms-excel",
+                "application/octet-stream",
+            }:
+                raise SheetsSafetyError(
+                    f"Google Sheets: CSV не получен (HTTP {response.status}, {media_type})."
+                )
+            raw = response.text().lstrip("\ufeff")
+            if re.match(r"\s*<(?:!doctype|html|head|body)\b", raw, re.I):
+                raise SheetsSafetyError("Google вернул HTML вместо данных листа.")
+            matrix = list(csv.reader(io.StringIO(raw), strict=True))
+            while matrix and not any(cell.strip() for cell in matrix[-1]):
+                matrix.pop()
+            return matrix
+        except SheetsSafetyError:
+            raise
+        except Exception as exc:
+            raise SheetsSafetyError("Не удалось надёжно прочитать целевой лист. Запись остановлена.") from exc
+        finally:
+            if response is not None:
+                response.dispose()
+
     def _read_active_sheet_matrix(self) -> list[list[str]]:
         """
         Надёжно копирует весь используемый диапазон активного листа.
@@ -744,366 +888,147 @@ class GoogleSheetsWriter:
             f"после 5 попыток. Последняя причина: {last_error}"
         )
 
-    @staticmethod
-    def _extract_pairs_from_matrix(matrix: list[list[str]]) -> set[tuple[str, str]]:
-        """
-        Extract real social+email pairs row-by-row.
+    _extract_pairs_from_matrix = staticmethod(extract_pairs)
 
-        A pair is created from values that occur on the SAME spreadsheet row.
-        This prevents a URL from one influencer row from being combined with an
-        email belonging to another row. When a row contains one URL and several
-        emails, all emails are paired with that URL. When it contains several
-        URLs and one email, that email is paired with all URLs. When there are
-        multiple URLs and multiple emails, nearest-column matching is used and
-        only genuinely row-local pairs are kept.
+    def load_target_sheet_profile_email_pairs(self) -> set[tuple[str, str]]:
         """
-        email_re = re.compile(
-            r"(?i)(?<![\w.+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
-            r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?![\w.-])"
+        Загружает комбинации «соцсеть + email» ТОЛЬКО из целевого листа.
+
+        Целевой лист — это ``self.sheet_name``, тот же лист, в который
+        приложение будет записывать найденных блогеров. Другие листы
+        таблицы вообще не читаются.
+        """
+        self._require_connection()
+
+        target_name = self._normalize_sheet_label(self.sheet_name)
+        if not target_name:
+            raise RuntimeError(
+                "Не задан целевой лист Google Sheets, в который будут записываться блогеры."
+            )
+
+        self.log("========================================")
+        self.log("ЗАГРУЗКА ДАННЫХ ЦЕЛЕВОГО ЛИСТА")
+        self.log(
+            f"Читаю только лист «{target_name}» — именно в него будут записываться новые блогеры."
         )
-        social_hosts = {
-            "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
-            "facebook.com", "fb.com", "x.com", "twitter.com",
-            "linkedin.com", "pinterest.com", "twitch.tv", "threads.net",
-            "snapchat.com", "vk.com", "vimeo.com", "telegram.me",
-            "t.me",
-        }
-        from urllib.parse import urlsplit
-        pairs: set[tuple[str, str]] = set()
 
-        def normalize_url(value: str) -> str:
-            value = str(value or "").strip()
-            if not value:
-                return ""
-            try:
-                if not re.match(r"^https?://", value, re.I):
-                    value = "https://" + value
-                parts = urlsplit(value)
-                host = (parts.hostname or "").lower().strip()
-                if host.startswith("www."):
-                    host = host[4:]
-                if not host:
-                    return ""
-                port = parts.port
-                netloc = host if not port or port in (80, 443) else f"{host}:{port}"
-                path = parts.path.rstrip("/") or ""
-                return f"https://{netloc}{path}"
-            except Exception:
-                return ""
+        # Переключаемся ровно на тот лист, который используется для записи.
+        self._activate_sheet_tab_by_name(target_name)
+        self.log(f"Google Sheets: активирован целевой лист «{target_name}».")
 
-        def looks_social(value: str) -> bool:
-            try:
-                candidate = value.strip()
-                if not re.match(r"^https?://", candidate, re.I):
-                    candidate = "https://" + candidate
-                host = (urlsplit(candidate).hostname or "").lower()
-                if host.startswith("www."):
-                    host = host[4:]
-                return host in social_hosts or any(host.endswith("." + h) for h in social_hosts)
-            except Exception:
-                return False
+        matrix = self._read_active_sheet_matrix_via_export(target_name)
+        rows_count = len(matrix)
+        self.log(
+            f"Целевой лист «{target_name}»: прочитано строк/рядов: {rows_count:,}"
+        )
 
-        for row in matrix:
-            row_cells = [str(c or "").strip() for c in row]
-            url_cells: list[tuple[int, str]] = []
-            email_cells: list[tuple[int, str]] = []
+        pairs = self._extract_pairs_from_matrix(matrix)
+        self.log(
+            f"Целевой лист «{target_name}»: найдено {len(pairs):,} уникальных пар «соцсеть + email»."
+        )
 
-            for col_idx, cell in enumerate(row_cells):
-                for email in email_re.findall(cell):
-                    email_cells.append((col_idx, email.lower()))
-                if looks_social(cell):
-                    u = normalize_url(cell)
-                    if u:
-                        url_cells.append((col_idx, u))
-                # Support a cell containing both URL and email or a label around a URL.
-                if not looks_social(cell):
-                    for match in re.findall(r"https?://[^\s<>]+", cell, re.I):
-                        candidate = match.rstrip(",.;)\"'")
-                        if looks_social(candidate):
-                            u = normalize_url(candidate)
-                            if u:
-                                url_cells.append((col_idx, u))
+        if not pairs:
+            self.log(
+                f"Целевой лист «{target_name}» не содержит ни одной пары «соцсеть + email»."
+            )
+        else:
+            self.log(
+                f"✅ Загружено в память: {len(pairs):,} уникальных комбинаций «соцсеть + email» "
+                f"только из листа «{target_name}»."
+            )
 
-            # De-duplicate values while keeping their column positions.
-            seen_urls = set()
-            urls = [(c, u) for c, u in url_cells if not (u in seen_urls or seen_urls.add(u))]
-            seen_emails = set()
-            emails = [(c, e) for c, e in email_cells if not (e in seen_emails or seen_emails.add(e))]
-            if not urls or not emails:
-                continue
-
-            if len(urls) == 1:
-                social = urls[0][1]
-                for _, email in emails:
-                    pairs.add((social, email))
-            elif len(emails) == 1:
-                email = emails[0][1]
-                for _, social in urls:
-                    pairs.add((social, email))
-            else:
-                # Multiple URLs/emails in one row: pair nearest columns. This avoids
-                # producing every possible cross-product and therefore avoids false
-                # duplicate matches across several influencers represented on one row.
-                remaining = list(emails)
-                for url_col, social in urls:
-                    nearest = min(remaining, key=lambda item: abs(item[0] - url_col))
-                    pairs.add((social, nearest[1]))
-                    remaining.remove(nearest)
-
+        self.log(
+            "Другие листы Google Sheets НЕ читаются и НЕ участвуют в антидедупликации."
+        )
+        self.log("========================================")
+        self.write_blocked = False
+        self.verified_pairs = set(pairs)
         return pairs
 
     def load_all_tabs_profile_email_pairs(self) -> set[tuple[str, str]]:
-        """
-        Loads social+email combinations from every sheet tab before parsing.
-        No data is written to the spreadsheet. The returned set is intended to
-        live only for the current parser run.
-        """
-        self._require_connection()
-        original_name = self.sheet_name
-        self.log("========================================")
-        self.log("ЗАГРУЗКА ДАННЫХ ВСЕЙ ТАБЛИЦЫ")
-        self.log("Читаю все вкладки Google Sheets в память...")
-
-        tabs = self.list_sheet_tabs()
-        self.log(f"Найдено вкладок: {len(tabs)}")
-
-        all_pairs: set[tuple[str, str]] = set()
-        successful = 0
-        total_pairs_found = 0
-        total_rows_read = 0
-        try:
-            for index, tab_name in enumerate(tabs, start=1):
-                self.log(f"[{index}/{len(tabs)}] НАЧАЛО ЧТЕНИЯ ВКЛАДКИ: «{tab_name}»")
-                self._activate_sheet_tab_by_name(tab_name)
-                matrix = self._read_active_sheet_matrix()
-                rows_count = len(matrix)
-                total_rows_read += rows_count
-                self.log(
-                    f"[{index}/{len(tabs)}] Вкладка «{tab_name}»: прочитано строк/рядов: {rows_count:,}"
-                )
-                pairs = self._extract_pairs_from_matrix(matrix)
-                found_count = len(pairs)
-                total_pairs_found += found_count
-                before = len(all_pairs)
-                all_pairs.update(pairs)
-                added_unique = len(all_pairs) - before
-                successful += 1
-                self.log(
-                    f"[{index}/{len(tabs)}] Вкладка «{tab_name}»: найдено {found_count:,} пар «соцсеть + email»; "
-                    f"новых уникальных после объединения: {added_unique:,}; всего в памяти: {len(all_pairs):,}"
-                )
-
-            if successful != len(tabs):
-                raise RuntimeError(
-                    f"Прочитано только {successful} из {len(tabs)} вкладок."
-                )
-
-            duplicates_inside_tabs = max(0, total_pairs_found - len(all_pairs))
-            self.log("----------------------------------------")
-            self.log("✅ ВСЕ ДАННЫЕ ИЗ ТАБЛИЦЫ СОБРАНЫ")
-            self.log(f"Вкладок обработано: {successful}/{len(tabs)}")
-            self.log(f"Всего строк/рядов прочитано: {total_rows_read:,}")
-            self.log(f"Всего найдено пар «ссылка + email» до объединения: {total_pairs_found:,}")
-            self.log(f"Уникальных комбинаций загружено в память: {len(all_pairs):,}")
-            self.log(f"Повторяющихся комбинаций отброшено при объединении: {duplicates_inside_tabs:,}")
-            self.log("Парсер можно запускать — сравнение будет выполняться только с этой памятью.")
-            self.log("----------------------------------------")
-            return all_pairs
-        finally:
-            # Always restore the working sheet; if restoring fails, fail closed.
-            try:
-                self._activate_sheet_tab_by_name(original_name)
-            except Exception as restore_error:
-                self.log(f"Не удалось вернуть рабочую вкладку «{original_name}»: {restore_error!r}")
-                raise
+        """Совместимый старый метод: теперь читает только целевой лист."""
+        return self.load_target_sheet_profile_email_pairs()
 
     # ============================================================
     # WRITE ROWS
     # ============================================================
 
-    def append_rows(self, rows: Iterable[list[str]]):
-        """
-        Записывает строки начиная с текущей ячейки.
-
-        Например, если start_cell = A2:
-
-            rows[0] -> A2:C2
-            rows[1] -> A3:C3
-            rows[2] -> A4:C4
-
-        После записи текущая строка автоматически увеличивается.
-
-        Если start_cell = D10:
-
-            rows[0] -> D10:F10
-            rows[1] -> D11:F11
-            rows[2] -> D12:F12
-        """
-
+    def append_rows(self, rows: Iterable[list[str]]) -> list[list[str]]:
+        """Read, deduplicate, paste once and verify the exact destination range."""
         self._require_connection()
-
+        if self.write_blocked:
+            raise SheetsSafetyError("Запись заблокирована. Обновите данные целевого листа.")
         rows = list(rows)
-
         if not rows:
-            self.log(
-                "Google Sheets: нечего записывать."
+            return []
+        try:
+            matrix = self._read_active_sheet_matrix_via_export(self.sheet_name)
+            existing = extract_pairs(matrix) | self.verified_pairs
+            clean_rows = filter_new_rows(rows, existing)
+            if not clean_rows:
+                self.log("Google Sheets: все строки уже существуют, вставка пропущена.")
+                return []
+
+            # Never overwrite old results when a new run starts from the same cell.
+            col = self.current_column - 1
+            last_occupied = max(
+                (i + 1 for i, row in enumerate(matrix) if any(str(v).strip() for v in row[col:col + 3])),
+                default=0,
             )
-            return
-
-        # --------------------------------------------------------
-        # Нормализуем строки.
-        # Всегда 3 колонки:
-        #
-        # Имя | Ссылка | Контакт
-        # --------------------------------------------------------
-
-        clean_rows = []
-
-        for row in rows:
-            row = list(row)
-
-            if len(row) < 3:
-                row += [""] * (3 - len(row))
-
-            clean_rows.append(
-                [
-                    str(row[0] or ""),
-                    str(row[1] or ""),
-                    str(row[2] or ""),
-                ]
+            target_row = max(self.current_row, last_occupied + 1)
+            target_cell = self._cell_to_string(self.current_column, target_row)
+            page = self.sheet_page
+            page.bring_to_front()
+            self._goto_cell(target_cell)
+            # Keep untrusted text literal, and serialize TSV with real quoting.
+            payload = io.StringIO()
+            csv.writer(payload, delimiter="\t", lineterminator="\n").writerows(
+                [("'" + value if value.startswith(("=", "+", "-", "@", "'")) else value) for value in row]
+                for row in clean_rows
             )
-
-        # --------------------------------------------------------
-        # Формируем TSV.
-        #
-        # Google Sheets при Ctrl+V сам раскладывает:
-        #
-        # \t -> колонки
-        # \n -> строки
-        # --------------------------------------------------------
-
-        tsv = "\n".join(
-            "\t".join(row)
-            for row in clean_rows
-        )
-
-        # --------------------------------------------------------
-        # Текущий адрес.
-        # --------------------------------------------------------
-
-        target_cell = self._cell_to_string(
-            self.current_column,
-            self.current_row,
-        )
-
-        self.log(
-            f"Google Sheets: записываю {len(clean_rows)} строк "
-            f"начиная с {target_cell}"
-        )
-
-        # --------------------------------------------------------
-        # Переходим ИМЕННО в target_cell.
-        #
-        # Никакого Ctrl+Home.
-        # Никакого Ctrl+Down.
-        # Никакого поиска последней строки.
-        # --------------------------------------------------------
-
-        self._goto_cell(target_cell)
-
-        page = self.sheet_page
-
-        if page is None:
-            raise RuntimeError(
-                "Страница Google Sheets недоступна."
-            )
-
-        # --------------------------------------------------------
-        # Кладём данные в системный Clipboard.
-        # --------------------------------------------------------
-
-        pyperclip.copy(tsv)
-
-        page.wait_for_timeout(200)
-
-        # --------------------------------------------------------
-        # Вставляем.
-        # --------------------------------------------------------
-
-        page.keyboard.press(f"{COPY_MOD}+V")
-
-        # --------------------------------------------------------
-        # Даём Sheets обработать вставку.
-        # --------------------------------------------------------
-
-        wait_ms = max(
-            1000,
-            min(
-                6000,
-                len(clean_rows) * 150,
-            ),
-        )
-
-        page.wait_for_timeout(wait_ms)
-
-        # --------------------------------------------------------
-        # ВАЖНО:
-        #
-        # Увеличиваем строку ТОЛЬКО после успешного Ctrl+V.
-        # --------------------------------------------------------
-
-        self.current_row += len(clean_rows)
-
-        next_cell = self._cell_to_string(
-            self.current_column,
-            self.current_row,
-        )
-
-        self.log(
-            f"Google Sheets: записано строк: {len(clean_rows)}"
-        )
-
-        self.log(
-            f"Google Sheets: следующая запись начнётся с {next_cell}"
-        )
+            previous_clipboard = pyperclip.paste()
+            tsv = payload.getvalue()
+            try:
+                pyperclip.copy(tsv)
+                page.keyboard.press(f"{COPY_MOD}+V")
+                # A successful keypress is not proof that Sheets saved anything.
+                verified = False
+                for delay in (1000, 2000, 4000):
+                    page.wait_for_timeout(delay)
+                    saved = self._read_active_sheet_matrix_via_export(self.sheet_name)
+                    actual = [
+                        (list(saved[i][col:col + 3]) + ["", "", ""])[:3]
+                        if i < len(saved) else ["", "", ""]
+                        for i in range(target_row - 1, target_row - 1 + len(clean_rows))
+                    ]
+                    if actual == clean_rows:
+                        verified = True
+                        break
+                if not verified:
+                    raise SheetsSafetyError(
+                        f"Вставка в {target_cell} не подтверждена. Повторная вставка отключена; "
+                        "проверьте таблицу и обновите данные листа."
+                    )
+            finally:
+                # Do not clobber anything the user copied while the bot was working.
+                if pyperclip.paste() == tsv:
+                    pyperclip.copy(previous_clipboard)
+            self.verified_pairs.update(extract_pairs(clean_rows))
+            self.current_row = target_row + len(clean_rows)
+            self.log(f"Google Sheets: подтверждена запись {len(clean_rows)} строк с {target_cell}.")
+            return clean_rows
+        except Exception as exc:
+            self.write_blocked = True
+            if isinstance(exc, SheetsSafetyError):
+                raise
+            raise SheetsSafetyError("Ошибка проверки или записи Google Sheets. Парсер остановлен.") from exc
 
     # ============================================================
     # ДЕДУПЛИКАЦИЯ ПО ПАРЕ «СОЦСЕТЬ + EMAIL»
     # ============================================================
 
-    @staticmethod
-    def normalize_social_url(value: str) -> str:
-        """Нормализует URL соцсети для надёжного сравнения."""
-        from urllib.parse import urlsplit, urlunsplit
-
-        value = (value or "").strip()
-        if not value:
-            return ""
-
-        try:
-            parts = urlsplit(value)
-            if not parts.netloc:
-                return value.rstrip("/").lower()
-
-            hostname = (parts.hostname or "").lower().strip()
-            if hostname.startswith("www."):
-                hostname = hostname[4:]
-
-            port = parts.port
-            netloc = hostname
-            if port and port not in (80, 443):
-                netloc = f"{hostname}:{port}"
-
-            path = parts.path.rstrip("/") or ""
-
-            # Схему приводим к https, query и fragment игнорируем.
-            return urlunsplit(("https", netloc, path, "", ""))
-        except Exception:
-            return value.rstrip("/").lower()
-
-    @staticmethod
-    def normalize_email(value: str) -> str:
-        return re.sub(r"\s+", "", (value or "").strip()).lower()
+    normalize_social_url = staticmethod(normalize_social_url)
+    normalize_email = staticmethod(normalize_email)
 
     @classmethod
     def make_profile_email_key(cls, social_url: str, email: str) -> tuple[str, str]:

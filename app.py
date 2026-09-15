@@ -21,7 +21,7 @@ from config import (
 )
 
 from parser import OnSocialParser, StopRequested
-from sheets import GoogleSheetsWriter
+from sheets import GoogleSheetsWriter, SheetsSafetyError
 
 
 # ============================================================
@@ -418,7 +418,7 @@ class App:
         ttk.Label(
             box,
             text=(
-                "Первая запись будет вставлена именно в эту ячейку. "
+                "Запись начнётся не выше этой ячейки и ниже занятых строк. "
                 "Следующие строки — ниже."
             ),
         ).grid(
@@ -448,7 +448,7 @@ class App:
 
         self.load_table_button = ttk.Button(
             box,
-            text="Обновить данные ВСЕЙ таблицы",
+            text="Обновить данные целевого листа",
             command=self.load_table_cache,
         )
 
@@ -461,7 +461,7 @@ class App:
         )
 
         self.table_cache_status_var = tk.StringVar(
-            value="После подключения Google Sheets приложение автоматически загрузит все листы и комбинации в память."
+            value="После подключения Google Sheets приложение автоматически загрузит данные только целевого листа и комбинации в память."
         )
 
         ttk.Label(
@@ -570,13 +570,13 @@ class App:
             padx=(0, 6),
         )
 
-        self.check_button = ttk.Button(
+        self.guide_button = ttk.Button(
             controls,
-            text="2. Проверить страницу",
-            command=self.check_page,
+            text="2. Как пользоваться",
+            command=self.show_guide,
         )
 
-        self.check_button.pack(
+        self.guide_button.pack(
             side="left",
             padx=6,
         )
@@ -632,14 +632,14 @@ class App:
         )
 
         self.log("Готово.")
-        self.log("1. Открой ON Social.")
-        self.log("2. Войди в аккаунт вручную.")
-        self.log("3. Открой Influencer Identification.")
-        self.log("4. Подключи Google Sheets.")
-        self.log("5. Нажми «Загрузить данные ВСЕЙ таблицы» — все вкладки будут прочитаны в память.")
-        self.log("6. Укажи начальную ячейку, например A2.")
-        self.log("7. Нажми «НАЧАТЬ».")
-        self.log("После завершения кэш автоматически удаляется — для нового запуска загрузите таблицу заново.")
+        self.log("1. Открой ON Social и войди в аккаунт вручную.")
+        self.log("2. Открой Influencer Identification.")
+        self.log("3. Подключи Google Sheets и укажи лист, в который бот будет записывать блогеров.")
+        self.log("4. Бот сам загрузит данные целевого листа в память дедупликации.")
+        self.log("5. Укажи начальную ячейку, например A2.")
+        self.log("6. Нажми «НАЧАТЬ».")
+        self.log("Во время работы бот ищет Analyze по мере прокрутки списка; заранее прокручивать весь список вручную не нужно.")
+        self.log("Кэш дедупликации живёт до закрытия приложения и пополняется после успешной записи новых комбинаций.")
 
     # ============================================================
     # LOG
@@ -947,6 +947,34 @@ class App:
 
         self._set_worker_busy(False)
 
+    def show_guide(self):
+
+        message = (
+            "ПОШАГОВЫЙ ГАЙД\n\n"
+            "1. Нажми «Открыть ON Social».\n"
+            "2. Войди в свой аккаунт ON Social и открой Influencer Identification.\n"
+            "3. Вставь ссылку на Google Sheets.\n"
+            "4. Выбери лист, в который бот должен записывать новых блогеров.\n"
+            "5. Подключи таблицу и дождись сообщения, что данные целевого листа загружены в память.\n"
+            "6. Укажи начальную ячейку для записи (например, A2).\n"
+            "7. Нажми «НАЧАТЬ».\n\n"
+            "Что делает бот автоматически:\n"
+            "• открывает зелёные и серые Analyze в текущем списке;\n"
+            "• если Analyze закончились, аккуратно подгружает следующую часть списка;\n"
+            "• не прокручивает весь список заранее;\n"
+            "• перед записью заново читает целевой лист и проверяет дубли;\n"
+            "• дубликаты не записывает;\n"
+            "• подтверждает запись чтением таблицы и сохраняет ключи в памяти;\n"
+            "• после Analyze обновляет страницу и снова подгружает список по мере необходимости.\n\n"
+            "Важно: предварительно вручную прокручивать список до конца не нужно.\n"
+            "Кэш дедупликации очищается только при полном закрытии приложения."
+        )
+
+        messagebox.showinfo(
+            "Как пользоваться ParserOnSocial",
+            message,
+        )
+
     # ============================================================
     # CHECK PAGE — WORKER
     # ============================================================
@@ -1052,7 +1080,7 @@ class App:
         self.root.after(
             0,
             lambda: self.table_cache_status_var.set(
-                "Таблица подключена. Автоматически загружаю все листы и комбинации в память..."
+                "Таблица подключена. Автоматически загружаю данные только целевого листа и комбинации в память..."
             ),
         )
 
@@ -1060,7 +1088,7 @@ class App:
             "Google Sheets подключена."
         )
         self.log(
-            "Автоматически загружаю ВСЮ таблицу во временную память дедупликации..."
+            "Автоматически загружаю данные ТОЛЬКО ЦЕЛЕВОГО ЛИСТА во временную память дедупликации..."
         )
 
         # Автоматическая первоначальная загрузка после подключения таблицы.
@@ -1099,25 +1127,19 @@ class App:
         self.root.after(
             0,
             lambda: self.table_cache_status_var.set(
-                "Загрузка всех вкладок... запуск парсера заблокирован."
+                "Загрузка целевого листа... запуск парсера заблокирован."
             ),
         )
 
         try:
-            pairs = self.sheets.load_all_tabs_profile_email_pairs()
-            if not pairs:
-                raise RuntimeError(
-                    "Во всей таблице не найдено ни одной комбинации «ссылка на соцсеть + email». "
-                    "Проверь структуру таблицы."
-                )
-
+            pairs = self.sheets.load_target_sheet_profile_email_pairs()
             self.table_cache_pairs = {
                 (
                     OnSocialParser.normalize_social_url(social),
                     OnSocialParser.normalize_email(email),
                 )
                 for social, email in pairs
-                if social and email
+                if social
             }
             self.table_cache_loaded = True
 
@@ -1146,7 +1168,7 @@ class App:
             self.root.after(
                 0,
                 lambda: self.table_cache_status_var.set(
-                    "Загрузка НЕ выполнена. Нужна повторная загрузка всей таблицы."
+                    "Загрузка НЕ выполнена. Обновите данные целевого листа."
                 ),
             )
             raise
@@ -1191,14 +1213,26 @@ class App:
         )
 
         # ------------------------------------------------------
-        # ДЕДУПЛИКАЦИЯ: используем только заранее загруженный
-        # пользователем кэш ВСЕЙ таблицы и ВСЕХ вкладок.
-        # Никакого повторного чтения таблицы во время запуска.
+        # ПЕРВИЧНОГО ПРОГРЕВА ВЕСЬ СПИСОК БОЛЬШЕ НЕТ.
+        # ------------------------------------------------------
+        # ВАЖНО: полная прокрутка списка заранее могла тратить лимит/токены
+        # впустую и уводила страницу в самый низ. Теперь бот работает
+        # пошагово: ищет Analyze в текущем DOM, обрабатывает найденные
+        # кнопки, а только когда их не осталось — делает ОДИН ограниченный
+        # шаг подгрузки следующей части списка и снова ищет Analyze.
+        self.log(
+            "Старт без предварительной прокрутки всего списка: "
+            "Analyze будут искаться и обрабатываться по мере подгрузки списка."
+        )
+
+        # ------------------------------------------------------
+        # ДЕДУПЛИКАЦИЯ: предварительный кэш целевого листа.
+        # Writer дополнительно перечитывает лист перед каждой вставкой.
         # ------------------------------------------------------
 
-        if not self.table_cache_loaded or not self.table_cache_pairs:
+        if not self.table_cache_loaded:
             raise RuntimeError(
-                "Перед запуском нужно нажать «Загрузить данные ВСЕЙ таблицы». "
+                "Перед запуском нужно обновить данные целевого листа. "
                 "Без предварительно загруженного кэша запуск запрещён."
             )
 
@@ -1218,7 +1252,7 @@ class App:
         # открытые профили (пагинация/скролл) — защита от
         # бесконечного цикла, если сайт реально их исчерпал.
         reveal_attempts = 0
-        MAX_REVEAL_ATTEMPTS = 3
+        MAX_REVEAL_ATTEMPTS = 10
 
         try:
 
@@ -1254,7 +1288,7 @@ class App:
             # ====================================================
 
             self.log(
-                f"Первая запись будет именно в {start_cell}"
+                f"Запись начнётся не выше {start_cell}, ниже существующих данных"
             )
 
             # ====================================================
@@ -1289,15 +1323,17 @@ class App:
 
                     if reveal_attempts < MAX_REVEAL_ATTEMPTS:
 
+                        reveal_attempts += 1
                         if parser.reveal_more_open_profiles(
                             self.list_page,
                         ):
-
-                            reveal_attempts += 1
-
                             continue
 
-                        reveal_attempts += 1
+                        self.log(
+                            f"Analyze пока не найдены; шаг подгрузки {reveal_attempts}/{MAX_REVEAL_ATTEMPTS} не дал движения. "
+                            "Повторяю поиск Analyze, прежде чем использовать Unlock."
+                        )
+                        continue
 
                     if unlocks >= max_unlocks:
 
@@ -1368,7 +1404,8 @@ class App:
                     # в DOM после возврата к списку.
                     # --------------------------------------------
 
-                    parser.mark_processed_element(button)
+                    # The report key was captured before navigation; do not resolve
+                    # a list locator again after it has navigated to a profile.
 
                     # --------------------------------------------
                     # Извлечение профиля
@@ -1385,113 +1422,23 @@ class App:
                         f"email={len(data.contacts)}"
                     )
 
-                    # --------------------------------------------
-                    # ПРОВЕРКА НА ДУБЛИКАТ
-                    #
-                    # ВАЖНО: теперь сравниваем именно комбинацию
-                    # «ссылка на соцсеть + email». Если хотя бы
-                    # одна такая комбинация уже есть в таблице
-                    # или была обработана в текущем запуске,
-                    # весь профиль пропускаем и переходим к
-                    # следующему Analyze.
-                    # --------------------------------------------
-
-                    if parser.profile_has_existing_email_pair(
-                        data.social_url,
-                        data.contacts,
-                    ):
-
-                        self.log(
-                            f"Пропущен дубль по комбинации "
-                            f"«соцсеть + email»: "
-                            f"{data.name!r} / {data.social_url!r}"
-                        )
-
+                    rows = [
+                        [data.name, data.social_url, contact]
+                        for contact in (data.contacts or [""])
+                    ]
+                    # The writer checks a fresh sheet snapshot, including empty
+                    # contacts, and returns only rows whose insertion was verified.
+                    written_rows = self.sheets.append_rows(rows)
+                    self.table_cache_pairs = set(self.sheets.verified_pairs)
+                    parser.processed_profile_email_pairs = set(self.table_cache_pairs)
+                    if not written_rows:
+                        self.log("Профиль пропущен: новых строк для таблицы нет.")
                         continue
-
-                    parser.mark_processed_email_pairs(
-                        data.social_url,
-                        data.contacts,
+                    next_cell = self.sheets._cell_to_string(
+                        self.sheets.current_column, self.sheets.current_row
                     )
-
-                    # --------------------------------------------
-                    # Формирование строк
-                    #
-                    # Один email = одна строка.
-                    #
-                    # Например:
-                    #
-                    # Иван | ссылка | a@mail.com
-                    # Иван | ссылка | b@mail.com
-                    # Иван | ссылка | c@mail.com
-                    # --------------------------------------------
-
-                    if data.contacts:
-
-                        rows = [
-                            [
-                                data.name,
-                                data.social_url,
-                                contact,
-                            ]
-                            for contact in data.contacts
-                        ]
-
-                    else:
-
-                        rows = [
-                            [
-                                data.name,
-                                data.social_url,
-                                "",
-                            ]
-                        ]
-
-                    self.log(
-                        f"Подготовлено строк: {len(rows)}"
-                    )
-
-                    # --------------------------------------------
-                    # ЗАПИСЬ В GOOGLE SHEETS
-                    #
-                    # Никакого поиска последней строки.
-                    #
-                    # sheets.py сам знает текущую ячейку.
-                    # --------------------------------------------
-
-                    self.log(
-                        "Записываю данные в Google Sheets..."
-                    )
-
-                    self.sheets.append_rows(
-                        rows,
-                    )
-
-                    # ------------------------------------------------
-                    # После успешной записи сразу добавляем новые
-                    # комбинации «соцсеть + email» в память.
-                    # Это предотвращает повторную запись того же
-                    # инфлюенсера в следующем цикле/прогоне.
-                    # ------------------------------------------------
-                    added_to_cache = 0
-                    for row in rows:
-                        social = str(row[1] or "").strip() if len(row) > 1 else ""
-                        email = str(row[2] or "").strip() if len(row) > 2 else ""
-                        if not social or not email:
-                            continue
-                        key = (
-                            OnSocialParser.normalize_social_url(social),
-                            OnSocialParser.normalize_email(email),
-                        )
-                        if key[0] and key[1] and key not in self.table_cache_pairs:
-                            self.table_cache_pairs.add(key)
-                            parser.processed_profile_email_pairs.add(key)
-                            added_to_cache += 1
-
-                    self.log(
-                        f"КЭШ ДЕДУПЛИКАЦИИ ОБНОВЛЁН: добавлено новых комбинаций «ссылка + email»: {added_to_cache}. "
-                        f"Всего теперь в памяти: {len(self.table_cache_pairs):,}."
-                    )
+                    self.root.after(0, lambda cell=next_cell: self.start_cell_var.set(cell))
+                    self.log(f"Подтверждено новых строк: {len(written_rows)}.")
 
                     processed += 1
 
@@ -1500,7 +1447,7 @@ class App:
                         f"{processed}/{max_influencers}"
                     )
 
-                except StopRequested:
+                except (StopRequested, SheetsSafetyError):
 
                     raise
 
@@ -1537,6 +1484,41 @@ class App:
                                 "вернуться к списку: "
                                 + repr(e)
                             )
+
+                    # --------------------------------------------
+                    # ПОСЛЕ КАЖДОГО ANALYZE ОБЯЗАТЕЛЬНО ОБНОВЛЯЕМ
+                    # ГЛАВНУЮ СТРАНИЦУ ON SOCIAL.
+                    #
+                    # Это нужно для получения свежего DOM и актуального
+                    # состояния списка после открытия/закрытия профиля.
+                    # processed_profiles и memory-cache при этом сохраняются,
+                    # поэтому обновление не сбрасывает дедупликацию.
+                    # --------------------------------------------
+
+                    try:
+
+                        reloaded = parser.reload_list_page(
+                            self.list_page,
+                        )
+
+                        if not reloaded:
+                            self.log(
+                                "⚠ Главную страницу OnSocial не удалось "
+                                "обновить после Analyze. Продолжаю с текущим DOM, "
+                                "но следующий поиск Analyze будет выполнен заново."
+                            )
+
+                    except StopRequested:
+
+                        raise
+
+                    except Exception as e:
+
+                        self.log(
+                            "Ошибка обновления главной страницы OnSocial "
+                            "после Analyze: "
+                            + repr(e)
+                        )
 
                     # ----------------------------------------
                     # АНТИ-БАН: случайная пауза перед
@@ -1581,6 +1563,8 @@ class App:
 
         except Exception as e:
 
+            if isinstance(e, SheetsSafetyError):
+                self.table_cache_loaded = False
             self.log(
                 "КРИТИЧЕСКАЯ ОШИБКА ПАРСЕРА: "
                 + repr(e)
@@ -1601,8 +1585,9 @@ class App:
             self.root.after(
                 0,
                 lambda c=current_cache_count: self.table_cache_status_var.set(
-                    f"Кэш дедупликации активен: {c:,} уникальных комбинаций. "
-                    "После закрытия приложения кэш будет полностью удалён."
+                    (f"Кэш дедупликации: {c:,} ключей. Проверка выполняется перед каждой записью."
+                     if self.table_cache_loaded else
+                     "Запись остановлена. Проверьте таблицу и обновите данные целевого листа.")
                 ),
             )
 
@@ -1808,7 +1793,7 @@ class App:
             )
             return
 
-        self.log("Запрашиваю полную загрузку таблицы перед стартом...")
+        self.log("Запрашиваю загрузку целевого листа перед стартом...")
         self._queue_command("load_table_cache")
 
     # ============================================================
@@ -1835,10 +1820,10 @@ class App:
 
             return
 
-        if not self.table_cache_loaded or not self.table_cache_pairs:
+        if not self.table_cache_loaded:
             messagebox.showwarning(
                 "Данные таблицы не загружены",
-                "Подожди, пока после подключения Google Sheets завершится автоматическая загрузка всей таблицы в память.\n\n"
+                "Подожди, пока после подключения Google Sheets завершится автоматическая загрузка целевого листа в память.\n\n"
                 "Кэш загружается один раз при подключении таблицы, затем пополняется новыми записанными комбинациями.\n"
                 "Он будет полностью удалён только при закрытии приложения.",
             )
@@ -1953,7 +1938,7 @@ class App:
         )
 
         self.log(
-            "Первая запись будет произведена именно туда."
+            "Запись начнётся с этой ячейки или ниже существующих данных."
         )
 
         self.log(

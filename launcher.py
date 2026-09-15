@@ -4,12 +4,15 @@ import os
 import subprocess
 import sys
 import traceback
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 
 def _log_path() -> Path:
     if sys.platform == "darwin":
         root = Path.home() / "Library" / "Application Support" / "OnSocialLocalParser"
+    elif os.name == "nt":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "OnSocialLocalParser"
     else:
         root = Path.home() / ".local" / "share" / "OnSocialLocalParser"
     root.mkdir(parents=True, exist_ok=True)
@@ -37,6 +40,10 @@ def _show_error(message: str) -> None:
             pass
 
     try:
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, message, "ParserOnSocial", 0x10)
+            return
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
     except Exception:
@@ -46,8 +53,18 @@ def _show_error(message: str) -> None:
 def main() -> None:
     if "--self-test" in sys.argv[1:]:
         from selftest import main as self_test_main
-
-        raise SystemExit(self_test_main())
+        import argparse
+        cli = argparse.ArgumentParser()
+        cli.add_argument("--self-test", action="store_true")
+        cli.add_argument("--self-test-log", type=Path)
+        options = cli.parse_args()
+        if options.self_test_log:
+            with options.self_test_log.open("w", encoding="utf-8") as stream:
+                with redirect_stdout(stream), redirect_stderr(stream):
+                    result = self_test_main()
+        else:
+            result = self_test_main()
+        raise SystemExit(result)
 
     try:
         from app import main as app_main
@@ -65,7 +82,7 @@ def main() -> None:
             "Приложение не смогло запуститься.\n\n"
             "Техническая ошибка записана в:\n"
             f"{path if path else 'Library/Application Support/OnSocialLocalParser/startup-error.log'}\n\n"
-            "Проверьте, что установлен Google Chrome и используете сборку для Apple Silicon (arm64)."
+            "Проверьте, что установлен Google Chrome и сборка подходит вашей системе."
         )
         _show_error(hint)
         raise

@@ -29,8 +29,8 @@ if os.path.isdir(driver_dir):
             driver_datas.append((path, dest_dir))
 
 a = Analysis(
-    ["../app.py"],
-    pathex=["../"],
+    [os.path.join(SPECPATH, "..", "launcher.py")],
+    pathex=[os.path.join(SPECPATH, "..")],
     binaries=[],
     datas=driver_datas,
     hiddenimports=[

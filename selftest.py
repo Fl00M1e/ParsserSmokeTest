@@ -90,7 +90,7 @@ def run_self_test() -> int:
     if chrome is None:
         raise RuntimeError(
             "Google Chrome was not found. ParserOnSocial uses channel=\"chrome\" "
-            "and therefore requires Google Chrome to be installed on the Mac."
+            "and therefore requires Google Chrome to be installed on this computer."
         )
     print(f"PASS: Google Chrome found: {chrome}")
 

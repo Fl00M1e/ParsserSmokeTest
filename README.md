@@ -21,7 +21,7 @@ ON Social (через видимый браузер) -> данные профи�
 - Парсер НЕ использует ON Social API.
 - Парсер НЕ пытается обходить CAPTCHA, лимиты, paywall или защиту сайта.
 - Авторизация ON Social выполняется вручную в локальном профиле браузера.
-- Google Sheets используется БЕЗ Google Sheets API: приложение открывает таблицу в том же браузере (где вы уже залогинены в Google), кладёт данные в системный буфер обмена и вставляет их через Ctrl+V/Cmd+V, как это сделал бы человек руками.
+- Google Sheets используется БЕЗ Google Sheets API: целевой лист читается через CSV-экспорт с авторизацией браузера. Новые строки вставляются через Clipboard и Ctrl+V/Cmd+V, затем проверяются повторным чтением.
 - `credentials.json` и `token.json` не используются — их не нужно создавать.
 - Данные отправляются в Google только потому, что целевая таблица находится в Google Sheets.
 - Перед массовой автоматизацией проверь, разрешает ли твой аккаунт/тариф ON Social такую автоматизацию. Их Terms of Service широко определяют scraping, поэтому отсутствие API не означает автоматическое разрешение на browser automation.
@@ -54,7 +54,7 @@ python app.py
 
 Нажми `Открыть ON Social`.
 В открывшемся браузере вручную войди в ON Social и открой страницу Influencer Identification.
-После этого нажми `Проверить страницу`.
+Подключи Google Sheets и дождись автоматической загрузки целевого листа. Кнопка `Как пользоваться` открывает пошаговую инструкцию.
 
 Затем можно запустить тест на 1 блогере.
 
@@ -65,7 +65,7 @@ python app.py
 3. На странице профиля ищет:
    - имя;
    - ссылку на социальную сеть по активному @username;
-   - email и/или телефон в блоке Contacts.
+   - email в блоке Contacts.
 4. Каждая контактная запись получает отдельную строку.
 5. После обработки возвращается к списку.
 6. Когда доступных Analyze больше нет, бот может нажать Unlock next.
@@ -108,12 +108,29 @@ GitHub Actions для macOS теперь проверяет не только а
 
 Если macOS после скачивания архива из GitHub сообщает, что программу нельзя открыть, это может быть не ошибка ARM64-сборки, а Gatekeeper/quarantine. Тест CI уже доказывает запуск на чистом ARM64 runner, но для публичного распространения нужен Developer ID + notarization Apple. До этого для локальной проверки можно открыть приложение через контекстное меню Finder → Open; не следует удалять файлы приложения или пересобирать его из-за одного только предупреждения Gatekeeper.
 
-## Duplicate protection: preload the whole spreadsheet
+## Защита от дублей и серые Analyze
 
-Before every parser run, click **"Загрузить данные ВСЕЙ таблицы"** after connecting the spreadsheet.
+После подключения автоматически загружается **целевой лист**, указанный в настройках. Другие листы не участвуют в проверке. Пустой лист допускается к работе.
 
-The app reads all tabs through the browser/Clipboard, extracts normalized social-network URL + email pairs, and keeps only those pairs in RAM for the current run. The parser then checks each discovered profile against this in-memory set and skips any profile for which a matching pair already exists.
+- Ключ дубля — нормализованная пара `ссылка на профиль + email`. HTTP/HTTPS, `www`, метки в ссылках и регистр email не создают новые записи.
+- Для профиля без email повторная пустая строка не добавляется. Новый email известного профиля можно добавить; совпавшие контакты пропускаются отдельно.
+- Перед каждой вставкой лист читается заново. Строки добавляются ниже занятых ячеек в трёх рабочих колонках, не выше указанной начальной ячейки.
+- Проверяется точное содержимое записанного диапазона. Кэш и следующая строка обновляются только после подтверждения.
+- При ошибке чтения, неоднозначном соответствии контакта профилю или неподтверждённой записи бот останавливается без повторной вставки. Проверьте таблицу и нажмите **«Обновить данные целевого листа»**.
+- Кэш хранится в памяти до закрытия приложения или переподключения/обновления таблицы. Буфер обмена восстанавливается, если пользователь за это время не скопировал другие данные.
 
-The cache is intentionally cleared after the run (normal completion, stop, or error). The next run requires a new preload, so the app does not keep the previous table snapshot between runs.
+Бот распознаёт зелёные и серые `Analyze`, `Analyzed`, `View report` и `Open report`. Ссылка на отчёт открывается и при неактивной вложенной кнопке. Неактивные элементы без ссылки пропускаются. Один отчёт открывается один раз за запуск; в следующем запуске серые элементы снова доступны.
 
-If even one sheet tab cannot be enumerated/read, preload fails closed and the parser is not allowed to start.
+Запись через интерфейс не блокирует других редакторов: одновременное изменение тех же ячеек между чтением и вставкой остаётся ограничением. CSV должен содержать сами ссылки профилей, а не только подписи гиперссылок.
+
+## Проверка и Windows-сборка
+
+Из корня проекта (нужен установленный Google Chrome):
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pip install -r build\requirements-build.txt
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --workpath build\work-current --distpath build\dist build\ParserOnSocial.win.spec
+```
+
+Браузерные тесты используют локально подставленные страницы, не обращаются к аккаунту ON Social и не изменяют Google Sheets. Собранный `build/dist/ParserOnSocial.exe` поддерживает `--self-test --self-test-log <путь-к-логу>` для проверки модулей и запуска Chrome без открытия рабочего профиля.

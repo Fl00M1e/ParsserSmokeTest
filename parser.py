@@ -4,6 +4,8 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from dedup import normalize_social_url, normalize_email
 from typing import Callable, Optional
 
 from playwright.sync_api import (
@@ -136,66 +138,54 @@ class OnSocialParser:
     # PROFILE KEY
     # ========================================================
 
+    def _analyze_href(self, element) -> str:
+        """Use only a report link actually present in the DOM."""
+        href = element.evaluate("""el => {
+            const link = el.closest('a[href]') || el.querySelector('a[href]');
+            return link ? link.getAttribute('href') : '';
+        }""") or ""
+        if not href:
+            return ""
+        absolute = urljoin(element.page.url, href)
+        target = urlsplit(absolute)
+        origin = urlsplit(element.page.url)
+        if (target.scheme, target.netloc) != (origin.scheme, origin.netloc):
+            return ""
+        if not re.search(r"/audience-data(?:/|$)", target.path):
+            return ""
+        return absolute
+
     def get_analyze_key(self, element) -> str:
-        """
-        Получает стабильный идентификатор Analyze.
-
-        В первую очередь используем href.
-
-        Если href отсутствует, пытаемся использовать текст
-        родительского блока.
-
-        Это нужно именно для ситуации, когда после Analyze
-        кнопка остаётся на странице.
-        """
-
-        try:
-            href = element.get_attribute("href")
-
-            if href:
-                href = href.strip()
-
-                if href:
-                    return f"href:{href}"
-
-        except Exception:
-            pass
-
-        # ----------------------------------------------------
-        # Fallback: текст родительского блока.
-        # ----------------------------------------------------
-
-        try:
-            parent = element.locator("xpath=..")
-
-            text = parent.inner_text().strip()
-
-            text = re.sub(
-                r"\s+",
-                " ",
-                text,
-            )
-
-            if text:
-                return f"parent:{text[:500]}"
-
-        except Exception:
-            pass
-
-        # ----------------------------------------------------
-        # Последний fallback.
-        # ----------------------------------------------------
-
-        try:
-            text = element.inner_text().strip()
-
-            if text:
-                return f"text:{text}"
-
-        except Exception:
-            pass
-
-        return f"element:{id(element)}"
+        href = self._analyze_href(element)
+        if href:
+            parts = urlsplit(href)
+            query = parse_qsl(parts.query, keep_blank_values=True)
+            social = next((normalize_social_url(v) for k, v in query if k == "url"), "")
+            if social:
+                return f"report:{social}"
+            return "href:" + urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                         urlencode(sorted(query)), ""))
+        # Card identity must survive the change from green Analyze to grey Analyzed.
+        identity = element.evaluate(r"""el => {
+            const row = el.closest('[data-profile-id], [data-influencer-id], tr, [role="row"]');
+            if (row) {
+                const id = row.getAttribute('data-profile-id') || row.getAttribute('data-influencer-id');
+                if (id) return 'id:' + id;
+                return 'row:' + row.innerText;
+            }
+            // Buttons are often wrapped in a div containing only the action.
+            // Walk up to the card's actual identity instead of returning "parent:".
+            for (let card = el.parentElement; card && card !== el.ownerDocument.body; card = card.parentElement) {
+                const link = Array.from(card.querySelectorAll('a[href]')).find(a =>
+                    /^@/.test(a.innerText.trim()));
+                if (link) return 'social:' + link.href;
+                const text = card.innerText.replace(/\b(?:analy[sz](?:e|ed)|view report|open report)\b/gi, '').trim();
+                if (text) return 'card:' + text;
+            }
+            return '';
+        }""") or ""
+        identity = re.sub(r"\b(?:analy[sz](?:e|ed)|view report|open report)\b", "", identity, flags=re.I)
+        return re.sub(r"\s+", " ", identity).strip()
 
     def is_already_processed(self, element) -> bool:
         key = self.get_analyze_key(element)
@@ -257,35 +247,40 @@ class OnSocialParser:
 
         return False
 
-    @staticmethod
-    def normalize_social_url(value: str) -> str:
-        from urllib.parse import urlsplit, urlunsplit
+    normalize_social_url = staticmethod(normalize_social_url)
+    normalize_email = staticmethod(normalize_email)
 
-        value = (value or "").strip()
-        if not value:
-            return ""
+    def get_existing_email_pairs(
+        self,
+        social_url: str,
+        emails: list[str],
+    ) -> tuple[set[tuple[str, str]], set[str]]:
+        """
+        Возвращает (существующие пары, новые email) для одного social URL.
 
-        try:
-            parts = urlsplit(value)
-            if not parts.netloc:
-                return value.rstrip("/").lower()
+        Метод используется как дополнительный защитный слой перед записью:
+        в Google Sheets можно передавать только те email, чьи пары ещё
+        отсутствуют в оперативном cache.
+        """
+        social = self.normalize_social_url(social_url)
+        existing: set[tuple[str, str]] = set()
+        new_emails: set[str] = set()
 
-            scheme = parts.scheme.lower()
-            hostname = (parts.hostname or "").lower()
-            port = parts.port
-            netloc = hostname
+        if not social:
+            return existing, new_emails
 
-            if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
-                netloc = f"{hostname}:{port}"
+        for raw_email in (emails or []):
+            email = self.normalize_email(raw_email)
+            if not email:
+                continue
 
-            path = parts.path.rstrip("/") or ""
-            return urlunsplit((scheme, netloc, path, "", ""))
-        except Exception:
-            return value.rstrip("/").lower()
+            key = (social, email)
+            if key in self.processed_profile_email_pairs:
+                existing.add(key)
+            else:
+                new_emails.add(email)
 
-    @staticmethod
-    def normalize_email(value: str) -> str:
-        return re.sub(r"\s+", "", (value or "").strip()).lower()
+        return existing, new_emails
 
     def profile_has_existing_email_pair(
         self,
@@ -339,154 +334,36 @@ class OnSocialParser:
     # ========================================================
 
     def find_analyze_buttons(self, page: Page):
-        """
-        Ищет Analyze среди button и link.
-
-        ВАЖНО:
-        Уже обработанные Analyze здесь сразу отбрасываются.
-        """
-
+        """Find fresh and previously opened reports regardless of button color."""
         self._check_stop()
-
-        result = []
-
-        # ----------------------------------------------------
-        # BUTTON
-        # ----------------------------------------------------
-
-        try:
-            buttons = page.get_by_role(
-                "button",
-                name=re.compile(
-                    r"^\s*Analyze\s*$",
-                    re.I,
-                ),
-            )
-
-            for i in range(buttons.count()):
-
-                self._check_stop()
-
-                element = buttons.nth(i)
-
-                try:
-                    if not element.is_visible():
-                        continue
-
-                    if not element.is_enabled():
-                        continue
-
-                    if self.is_already_processed(element):
-                        self.log(
-                            "Analyze пропущен: "
-                            "этот профиль уже обрабатывался."
-                        )
-                        continue
-
-                    result.append(element)
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        # ----------------------------------------------------
-        # LINK
-        # ----------------------------------------------------
-
-        try:
-            links = page.get_by_role(
-                "link",
-                name=re.compile(
-                    r"^\s*Analyze\s*$",
-                    re.I,
-                ),
-            )
-
-            for i in range(links.count()):
-
-                self._check_stop()
-
-                element = links.nth(i)
-
-                try:
-                    if not element.is_visible():
-                        continue
-
-                    if self.is_already_processed(element):
-                        self.log(
-                            "Analyze link пропущен: "
-                            "профиль уже обрабатывался."
-                        )
-                        continue
-
-                    result.append(element)
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        # ----------------------------------------------------
-        # FALLBACK
-        # ----------------------------------------------------
-
-        if not result:
-
-            try:
-
-                candidates = page.locator(
-                    "a, button"
-                )
-
-                for i in range(
-                    candidates.count()
-                ):
-
-                    self._check_stop()
-
-                    element = candidates.nth(i)
-
-                    try:
-
-                        if not element.is_visible():
-                            continue
-
-                        text = (
-                            element
-                            .inner_text()
-                            .strip()
-                        )
-
-                        if not re.fullmatch(
-                            r"Analyze",
-                            text,
-                            re.I,
-                        ):
-                            continue
-
-                        if self.is_already_processed(
-                            element
-                        ):
-                            continue
-
-                        result.append(
-                            element
-                        )
-
-                    except Exception:
-                        continue
-
-            except Exception:
-                pass
-
-        self.log(
-            f"Поиск Analyze: доступно новых: "
-            f"{len(result)}"
+        result, seen = [], set()
+        candidates = page.locator("a, button, [role='button'], [role='link']")
+        labels = re.compile(
+            r"^\s*(?:analy[sz]e|analy[sz]ed|view report|open report)\s*$", re.I
         )
-
+        for i in range(candidates.count()):
+            self._check_stop()
+            element = candidates.nth(i)
+            if not element.is_visible():
+                continue
+            text = (element.inner_text() or "").strip()
+            aria = element.get_attribute("aria-label") or ""
+            href = self._analyze_href(element)
+            if not href and not (labels.fullmatch(text) or labels.fullmatch(aria)):
+                continue
+            # Disabled grey controls can still contain a link to an existing report.
+            if not element.is_enabled() and not href:
+                self.log("Analyze недоступен: у неактивной кнопки нет ссылки на отчёт.")
+                continue
+            key = self.get_analyze_key(element)
+            if not key:
+                self.log("Analyze пропущен: не удалось определить профиль карточки.")
+                continue
+            if key in seen or key in self.processed_profiles:
+                continue
+            seen.add(key)
+            result.append(element)
+        self.log(f"Поиск Analyze: доступно {len(result)} зелёных/серых элементов.")
         return result
 
     # ========================================================
@@ -636,7 +513,17 @@ class OnSocialParser:
 
         before_url = list_page.url
 
-        before_title = list_page.title()
+        href = self._analyze_href(element)
+        if href or not element.is_enabled():
+            if not href:
+                raise RuntimeError("У неактивного Analyze нет ссылки на отчёт.")
+            profile_page = self.context.new_page()
+            try:
+                profile_page.goto(href, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+                return profile_page
+            except Exception:
+                profile_page.close()
+                raise
 
         # ----------------------------------------------------
         # ФИЗИЧЕСКИЙ КЛИК
@@ -1077,6 +964,203 @@ class OnSocialParser:
     # GO BACK
     # ========================================================
 
+    def _capture_scroll_state(self, page: Page):
+        """Сохраняет положение окна и внутренних scroll-контейнеров списка."""
+        try:
+            return page.evaluate("""() => {
+                const items = [];
+                for (const el of document.querySelectorAll('*')) {
+                    const cs = getComputedStyle(el);
+                    const scrollable =
+                        (cs.overflowY === 'auto' || cs.overflowY === 'scroll' ||
+                         cs.overflow === 'auto' || cs.overflow === 'scroll') &&
+                        el.scrollHeight > el.clientHeight + 20;
+                    if (!scrollable || el.scrollTop <= 0) continue;
+                    items.push({
+                        id: el.id || '',
+                        className: typeof el.className === 'string' ? el.className : '',
+                        scrollTop: el.scrollTop,
+                        clientHeight: el.clientHeight,
+                        scrollHeight: el.scrollHeight,
+                    });
+                }
+                items.sort((a, b) => b.scrollTop - a.scrollTop);
+                return {
+                    windowY: window.scrollY || 0,
+                    windowX: window.scrollX || 0,
+                    containers: items.slice(0, 8),
+                };
+            }""")
+        except Exception:
+            return {"windowY": 0, "windowX": 0, "containers": []}
+
+    def _restore_scroll_state(self, page: Page, state) -> bool:
+        """Восстанавливает scrollTop после reload, включая внутренний контейнер списка."""
+        try:
+            return bool(page.evaluate(r"""(state) => {
+                let restoredAny = false;
+                for (const item of (state?.containers || [])) {
+                    let el = null;
+                    if (item.id) el = document.getElementById(item.id);
+                    if (!el && item.className) {
+                        const classes = item.className.split(/\s+/).filter(Boolean).slice(0, 6);
+                        if (classes.length) {
+                            try {
+                                const selector = '.' + classes.map(c => CSS.escape(c)).join('.');
+                                for (const candidate of document.querySelectorAll(selector)) {
+                                    if (candidate.scrollHeight > candidate.clientHeight + 20) {
+                                        el = candidate;
+                                        break;
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                    if (el) {
+                        el.scrollTop = Math.min(
+                            item.scrollTop || 0,
+                            Math.max(0, el.scrollHeight - el.clientHeight)
+                        );
+                        restoredAny = true;
+                    }
+                }
+                if (typeof state?.windowY === 'number') {
+                    window.scrollTo(state.windowX || 0, state.windowY || 0);
+                }
+                return restoredAny || typeof state?.windowY === 'number';
+            }""", state))
+        except Exception:
+            return False
+
+    def _progressively_restore_scroll(self, page: Page, state, max_steps: int = 40) -> int:
+        """Пошагово прокручивает список к прежней позиции, чтобы сработал lazy/infinite scroll."""
+        targets = [
+            {
+                "id": item.get("id", ""),
+                "className": item.get("className", ""),
+                "target": float(item.get("scrollTop", 0) or 0),
+            }
+            for item in (state or {}).get("containers", [])
+            if float(item.get("scrollTop", 0) or 0) > 0
+        ]
+        if not targets:
+            return 0
+
+        def step():
+            return page.evaluate("""(targets) => {
+                function findContainer(item) {
+                    if (item.id) {
+                        const byId = document.getElementById(item.id);
+                        if (byId) return byId;
+                    }
+                    if (item.className) {
+                        const classes = item.className.split(/\\s+/).filter(Boolean).slice(0, 6);
+                        if (classes.length) {
+                            try {
+                                const selector = '.' + classes.map(c => CSS.escape(c)).join('.');
+                                for (const candidate of document.querySelectorAll(selector)) {
+                                    if (candidate.scrollHeight > candidate.clientHeight + 20) return candidate;
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                    return null;
+                }
+
+                const result = [];
+                for (const item of targets) {
+                    const el = findContainer(item);
+                    if (!el) {
+                        result.push(false);
+                        continue;
+                    }
+                    const current = el.scrollTop || 0;
+                    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+                    const target = Math.min(item.target || 0, maxTop);
+                    const next = Math.min(target, current + 800);
+                    el.scrollTop = next;
+                    el.dispatchEvent(new Event('scroll', {bubbles: true}));
+                    result.push(Math.abs(next - target) < 5);
+                }
+                return result;
+            }""", targets)
+
+        completed = 0
+        for _ in range(max_steps):
+            self._check_stop()
+            result = step()
+            if result and all(result):
+                completed += 1
+                break
+            completed += 1
+            page.wait_for_timeout(250)
+        return completed
+
+    def reload_list_page(self, list_page: Page, attempts: int = 2) -> bool:
+        """
+        Обновляет список после Analyze, но сохраняет текущую позицию.
+        OnSocial часто использует внутренний scroll-контейнер/виртуализацию,
+        поэтому простого window.scrollY недостаточно.
+        """
+        self._check_stop()
+        last_error = None
+        scroll_state = self._capture_scroll_state(list_page)
+        self.log(
+            "Сохранил положение списка перед reload: "
+            f"windowY={scroll_state.get('windowY', 0)}, "
+            f"scroll-контейнеров={len(scroll_state.get('containers', []))}."
+        )
+
+        for attempt in range(1, attempts + 1):
+            try:
+                list_page.bring_to_front()
+                self.log(
+                    f"Обновляю главную страницу OnSocial после Analyze "
+                    f"(попытка {attempt}/{attempts})..."
+                )
+                list_page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=DEFAULT_TIMEOUT_MS,
+                )
+                try:
+                    list_page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                list_page.wait_for_timeout(1800)
+                restored = self._restore_scroll_state(list_page, scroll_state)
+                steps = self._progressively_restore_scroll(list_page, scroll_state)
+                for _ in range(4):
+                    list_page.wait_for_timeout(500)
+
+                self.log(
+                    "✅ Главная страница OnSocial обновлена. "
+                    f"Позиция списка восстановлена: {'ДА' if restored else 'НЕТ'}, "
+                    f"пошаговое восстановление выполнено за {steps} шаг(ов). "
+                    f"URL: {list_page.url}"
+                )
+                return True
+            except Exception as exc:
+                last_error = exc
+                self.log(
+                    f"Не удалось обновить главную страницу OnSocial "
+                    f"(попытка {attempt}/{attempts}): {exc!r}"
+                )
+                if attempt < attempts:
+                    try:
+                        list_page.wait_for_timeout(1000)
+                    except Exception:
+                        time.sleep(1)
+
+        self.log(
+            "❌ Не удалось обновить главную страницу OnSocial "
+            f"после {attempts} попыток: {last_error!r}"
+        )
+        return False
+
+    # ========================================================
+    # GO BACK
+    # ========================================================
+
     def go_back_to_list(
         self,
         profile_page: Page,
@@ -1137,150 +1221,268 @@ class OnSocialParser:
     # ПОДГРУЗКА ЕЩЁ ОТКРЫТЫХ ПРОФИЛЕЙ (СКРОЛЛ / NEXT)
     # ========================================================
 
+    def load_initial_full_list(self, page: Page, max_steps: int = 80, stable_rounds: int = 4) -> bool:
+        """
+        При первом запуске автоматически раскрывает весь доступный список.
+
+        On Social использует lazy/infinite scroll и/или внутренние scroll-контейнеры,
+        поэтому одного поиска Analyze в текущем viewport недостаточно. Мы
+        постепенно прокручиваем все подходящие контейнеры и окно, пока высота
+        содержимого и/или положение прокрутки перестают меняться несколько раз подряд.
+        Это не нажимает Unlock и не открывает новые платные профили — только
+        загружает уже доступный список в DOM.
+        """
+        self._check_stop()
+        self.log("Первичный запуск: автоматически подгружаю весь доступный список OnSocial...")
+
+        stable = 0
+        moved_total = False
+        last_signature = None
+
+        def one_step():
+            return page.evaluate("""() => {
+                const all = [document.scrollingElement, document.documentElement, document.body, ...document.querySelectorAll('*')];
+                const seen = new Set();
+                const targets = [];
+                for (const el of all) {
+                    if (!el || seen.has(el)) continue;
+                    seen.add(el);
+                    try {
+                        const sh = el.scrollHeight || 0;
+                        const ch = el.clientHeight || 0;
+                        if (sh > ch + 200) targets.push(el);
+                    } catch (_) {}
+                }
+
+                let moved = false;
+                let bottomCount = 0;
+                const signature = [];
+
+                for (const el of targets) {
+                    try {
+                        const maxTop = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));
+                        const before = el.scrollTop || 0;
+                        const next = Math.min(maxTop, before + Math.max(700, Math.floor((el.clientHeight || 900) * 0.9)));
+                        if (next > before + 2) {
+                            el.scrollTop = next;
+                            el.dispatchEvent(new Event('scroll', {bubbles: true}));
+                            moved = true;
+                        }
+                        if (Math.abs(next - maxTop) < 5) bottomCount++;
+                        signature.push([Math.round(el.scrollTop || 0), Math.round(el.scrollHeight || 0), Math.round(el.clientHeight || 0)]);
+                    } catch (_) {}
+                }
+
+                try {
+                    const se = document.scrollingElement || document.documentElement || document.body;
+                    const maxTop = Math.max(0, se.scrollHeight - se.clientHeight);
+                    const before = se.scrollTop || 0;
+                    const next = Math.min(maxTop, before + Math.max(900, Math.floor(se.clientHeight * 0.9)));
+                    if (next > before + 2) {
+                        window.scrollTo(0, next);
+                        moved = true;
+                    }
+                    if (Math.abs(next - maxTop) < 5) bottomCount++;
+                    signature.push(['window', Math.round(se.scrollTop || 0), Math.round(se.scrollHeight || 0), Math.round(se.clientHeight || 0)]);
+                } catch (_) {}
+
+                return { moved, bottomCount, count: targets.length, signature };
+            }""")
+
+        for step in range(1, max_steps + 1):
+            self._check_stop()
+            state = one_step()
+            sig = repr(state.get("signature", []))
+            if state.get("moved"):
+                moved_total = True
+                stable = 0
+                self.log(
+                    f"Первичный список: шаг {step}/{max_steps}, "
+                    f"прокручено контейнеров: {state.get('count', 0)}, "
+                    f"контейнеров у низа: {state.get('bottomCount', 0)}."
+                )
+            else:
+                if sig == last_signature:
+                    stable += 1
+                else:
+                    stable = 1
+            last_signature = sig
+
+            page.wait_for_timeout(450)
+            if stable >= stable_rounds:
+                break
+
+        # Возвращаемся к началу: после полного прогрева списка бот начнёт
+        # обработку сверху, а уже загруженные карточки остаются доступными.
+        try:
+            page.evaluate("""() => {
+                const all = [document.scrollingElement, document.documentElement, document.body, ...document.querySelectorAll('*')];
+                for (const el of all) {
+                    try { if (el && el.scrollHeight > el.clientHeight + 200) el.scrollTop = 0; } catch (_) {}
+                }
+                try { window.scrollTo(0, 0); } catch (_) {}
+            }""")
+        except Exception:
+            pass
+        page.wait_for_timeout(800)
+        self.log(
+            "✅ Первичная загрузка списка завершена: "
+            f"список прогрет={'ДА' if moved_total else 'НЕТ/уже загружен'}. "
+            "Бот начнёт поиск Analyze с верхней позиции."
+        )
+        return moved_total
+
     def reveal_more_open_profiles(
         self,
         page: Page,
     ) -> bool:
         """
-        Когда Analyze на экране закончились, это ещё не значит,
-        что закончились все УЖЕ ОТКРЫТЫЕ (не заблокированные)
-        блогеры — их список может быть постраничным или
-        подгружаться по скроллу (infinite scroll).
+        Делает ОДИН небольшой шаг прокрутки/пагинации, а затем
+        управление сразу возвращается в основной цикл, который
+        заново ищет Analyze.
 
-        До этого бот в такой ситуации сразу переходил к
-        Unlock next (это про ПЛАТНОЕ открытие НОВЫХ, ещё
-        заблокированных профилей — другой механизм).
-
-        Эта функция пытается:
-        1) найти и нажать явную кнопку "Next" / "next page" /
-           "»" / "Показать ещё" пагинации списка;
-        2) если такой кнопки нет — проскроллить список вниз,
-           чтобы сработал infinite scroll.
-
-        Возвращает True, если что-то предприняла (клик или
-        скролл) — тогда стоит попробовать find_analyze_buttons
-        ещё раз. Ничего не гарантирует: сама проверка "стало
-        ли больше кнопок" — на стороне вызывающего кода.
+        ВАЖНО: OnSocial использует внутренние scroll-контейнеры.
+        Поэтому page.mouse.wheel() по окну недостаточно: мы ищем
+        реальные прокручиваемые контейнеры и прокручиваем наиболее
+        вероятный контейнер списка.
         """
-
         self._check_stop()
 
-        # ----------------------------------------------------
-        # 1) Явная кнопка пагинации.
-        # ----------------------------------------------------
-
+        # 1) Явная пагинация / Show more.
         pagination_re = re.compile(
             r"^\s*(next|next page|show more|load more|"
-            r"показать ещё|показать еще|далее|"
-            r"»|›|>)\s*$",
+            r"показать ещё|показать еще|далее|»|›|>)\s*$",
             re.I,
         )
-
         try:
-            candidates = page.locator(
-                "button, a, [role='button']"
-            )
-
-            count = candidates.count()
-
-            for i in range(count):
-
+            candidates = page.locator("button, a, [role='button']")
+            for i in range(candidates.count()):
                 self._check_stop()
-
-                element = candidates.nth(i)
-
+                el = candidates.nth(i)
                 try:
-
-                    if not element.is_visible():
+                    if not el.is_visible() or not el.is_enabled():
                         continue
-
-                    text = (
-                        element.inner_text() or ""
-                    ).strip()
-
-                    aria = (
-                        element.get_attribute("aria-label")
-                        or ""
-                    ).strip()
-
-                    if not (
-                        pagination_re.fullmatch(text)
-                        or pagination_re.fullmatch(aria)
-                    ):
+                    text = (el.inner_text() or "").strip()
+                    aria = (el.get_attribute("aria-label") or "").strip()
+                    if not (pagination_re.fullmatch(text) or pagination_re.fullmatch(aria)):
                         continue
-
-                    if hasattr(element, "is_enabled"):
-                        if not element.is_enabled():
-                            continue
-
-                    element.scroll_into_view_if_needed()
-
-                    element.click(
-                        timeout=DEFAULT_TIMEOUT_MS,
-                    )
-
-                    page.wait_for_timeout(1200)
-
-                    self.log(
-                        "Нажата кнопка пагинации списка "
-                        f"({text or aria!r})."
-                    )
-
+                    el.scroll_into_view_if_needed()
+                    el.click(timeout=DEFAULT_TIMEOUT_MS)
+                    page.wait_for_timeout(1000)
+                    self.log(f"Найдена и нажата пагинация списка: {text or aria!r}.")
                     return True
-
                 except Exception:
                     continue
-
         except Exception:
             pass
 
-        # ----------------------------------------------------
-        # 2) Infinite scroll — просто скроллим вниз.
-        # ----------------------------------------------------
-
+        # 2) Основной путь: прокрутить внутренний контейнер списка.
         try:
+            result = page.evaluate(r"""() => {
+                const all = Array.from(document.querySelectorAll('*'));
+                const candidates = [];
 
-            before_height = page.evaluate(
-                "document.body.scrollHeight"
-            )
+                for (const el of all) {
+                    try {
+                        const r = el.getBoundingClientRect();
+                        const cs = getComputedStyle(el);
+                        const sh = el.scrollHeight || 0;
+                        const ch = el.clientHeight || 0;
+                        const sw = el.scrollWidth || 0;
+                        const cw = el.clientWidth || 0;
+                        const oy = cs.overflowY || '';
+                        const isYScroll = sh > ch + 120 && (oy === 'auto' || oy === 'scroll' || oy === 'overlay');
+                        const isWindowLike = el === document.scrollingElement || el === document.documentElement || el === document.body;
+                        if (!isYScroll && !isWindowLike) continue;
+                        if (r.width < 250 || r.height < 180) continue;
+                        if (r.bottom < 0 || r.top > window.innerHeight) continue;
+                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
 
-            page.mouse.wheel(0, 2400)
+                        const buttons = el.querySelectorAll('button, a').length;
+                        candidates.push({el, r, sh, ch, sw, cw, oy, buttons, top: el.scrollTop || 0});
+                    } catch (_) {}
+                }
 
-            page.wait_for_timeout(1200)
+                // Предпочитаем большой видимый вертикальный контейнер с элементами.
+                candidates.sort((a, b) => {
+                    const score = x =>
+                        (x.buttons > 0 ? 500000 : 0) +
+                        x.r.width * x.r.height +
+                        (x.sh - x.ch) * 2;
+                    return score(b) - score(a);
+                });
 
-            after_height = page.evaluate(
-                "document.body.scrollHeight"
-            )
+                let moved = false;
+                let chosen = null;
+                const STEP = 900;
 
-            if after_height != before_height:
+                for (const item of candidates.slice(0, 8)) {
+                    try {
+                        const maxTop = Math.max(0, item.sh - item.ch);
+                        const before = Number(item.el.scrollTop || 0);
+                        if (before >= maxTop - 3) continue;
 
+                        const next = Math.min(maxTop, before + STEP);
+                        item.el.scrollTop = next;
+                        item.el.dispatchEvent(new Event('scroll', {bubbles: true}));
+
+                        if (Number(item.el.scrollTop || 0) > before + 2) {
+                            moved = true;
+                            chosen = {
+                                before,
+                                after: Number(item.el.scrollTop || 0),
+                                maxTop,
+                                width: Math.round(item.r.width),
+                                height: Math.round(item.r.height),
+                                buttons: item.buttons
+                            };
+                            break;
+                        }
+                    } catch (_) {}
+                }
+
+                // Fallback: прокручиваем окно небольшим шагом.
+                if (!moved) {
+                    try {
+                        const se = document.scrollingElement || document.documentElement || document.body;
+                        const before = Number(se.scrollTop || 0);
+                        const maxTop = Math.max(0, se.scrollHeight - se.clientHeight);
+                        if (before < maxTop - 3) {
+                            const next = Math.min(maxTop, before + STEP);
+                            se.scrollTop = next;
+                            window.scrollTo(0, next);
+                            if (Number(se.scrollTop || 0) > before + 2) {
+                                moved = true;
+                                chosen = {before, after: Number(se.scrollTop || 0), maxTop, window: true};
+                            }
+                        }
+                    } catch (_) {}
+                }
+
+                return {
+                    moved,
+                    chosen,
+                    candidates: candidates.length
+                };
+            }""")
+
+            if result and result.get("moved"):
+                chosen = result.get("chosen") or {}
                 self.log(
-                    "Список проскроллен, "
-                    "подгрузился дополнительный контент."
+                    "Сделан один шаг прокрутки списка: "
+                    f"{chosen.get('before')} -> {chosen.get('after')} "
+                    f"(max={chosen.get('maxTop')}). "
+                    "Теперь сразу повторно ищу Analyze."
                 )
-
+                page.wait_for_timeout(900)
                 return True
 
-            # Пробуем ещё раз чуть подождать —
-            # некоторые сайты подгружают с задержкой.
-
-            page.wait_for_timeout(1000)
-
-            after_height_2 = page.evaluate(
-                "document.body.scrollHeight"
+            self.log(
+                "Прокрутить список ещё на один шаг не удалось: "
+                "все найденные контейнеры уже внизу или прокрутка не изменилась."
             )
-
-            if after_height_2 != before_height:
-
-                self.log(
-                    "Список проскроллен (с задержкой), "
-                    "подгрузился дополнительный контент."
-                )
-
-                return True
-
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log(f"Ошибка при пошаговой прокрутке списка: {exc!r}")
 
         return False
 
