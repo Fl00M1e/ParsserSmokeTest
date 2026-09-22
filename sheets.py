@@ -72,6 +72,8 @@ class GoogleSheetsWriter:
         self.connected = False
         self.write_blocked = False
         self.verified_pairs: set[tuple[str, str]] = set()
+        # Pairs confirmed by the latest paste.
+        self.last_verified_pairs: set[tuple[str, str]] = set()
 
         # --------------------------------------------------------
         # Начальная позиция записи.
@@ -959,6 +961,7 @@ class GoogleSheetsWriter:
         if self.write_blocked:
             raise SheetsSafetyError("Запись заблокирована. Обновите данные целевого листа.")
         rows = list(rows)
+        self.last_verified_pairs.clear()
         if not rows:
             return []
         try:
@@ -1013,7 +1016,9 @@ class GoogleSheetsWriter:
                 # Do not clobber anything the user copied while the bot was working.
                 if pyperclip.paste() == tsv:
                     pyperclip.copy(previous_clipboard)
-            self.verified_pairs.update(extract_pairs(clean_rows))
+            new_pairs = extract_pairs(clean_rows)
+            self.verified_pairs.update(new_pairs)
+            self.last_verified_pairs.update(new_pairs)
             self.current_row = target_row + len(clean_rows)
             self.log(f"Google Sheets: подтверждена запись {len(clean_rows)} строк с {target_cell}.")
             return clean_rows

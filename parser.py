@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
-from dedup import normalize_social_url, normalize_email
+from dedup import EMAIL_RE, normalize_social_url, normalize_email
 from typing import Callable, Optional
 
 from playwright.sync_api import (
@@ -24,18 +24,10 @@ from config import (
 )
 
 
-# ============================================================
-# EMAIL
-# ============================================================
-
-EMAIL_RE = re.compile(
-    r"(?i)"
-    r"(?<![\w.+-])"
-    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
-    r"@"
-    r"[A-Za-z0-9-]+"
-    r"(?:\.[A-Za-z0-9-]+)+"
-    r"(?![\w.-])"
+# Current ON Social actions.
+ANALYZE_LABEL_RE = re.compile(
+    r"^\s*(?:analy[sz]e|view)\s*$",
+    re.I,
 )
 
 
@@ -93,6 +85,8 @@ class OnSocialParser:
             page = self.current_page()
 
         delay = ACTION_DELAY_MS if ms is None else ms
+        if delay <= 0:
+            return
 
         try:
             page.wait_for_timeout(delay)
@@ -115,6 +109,8 @@ class OnSocialParser:
         """
 
         self._check_stop()
+        if max_ms <= 0:
+            return
 
         delay_ms = random.randint(min_ms, max_ms)
 
@@ -165,7 +161,7 @@ class OnSocialParser:
                 return f"report:{social}"
             return "href:" + urlunsplit((parts.scheme, parts.netloc, parts.path,
                                          urlencode(sorted(query)), ""))
-        # Card identity must survive the change from green Analyze to grey Analyzed.
+        # Card identity must survive the change from green Analyze to grey View.
         identity = element.evaluate(r"""el => {
             const row = el.closest('[data-profile-id], [data-influencer-id], tr, [role="row"]');
             if (row) {
@@ -179,12 +175,19 @@ class OnSocialParser:
                 const link = Array.from(card.querySelectorAll('a[href]')).find(a =>
                     /^@/.test(a.innerText.trim()));
                 if (link) return 'social:' + link.href;
-                const text = card.innerText.replace(/\b(?:analy[sz](?:e|ed)|view report|open report)\b/gi, '').trim();
+                const text = card.innerText.replace(/\b(?:analy[sz]e|view)\b/gi, '').trim();
                 if (text) return 'card:' + text;
             }
             return '';
         }""") or ""
-        identity = re.sub(r"\b(?:analy[sz](?:e|ed)|view report|open report)\b", "", identity, flags=re.I)
+        # Keep stable IDs and URLs unchanged.
+        if identity.startswith(("card:", "row:")):
+            identity = re.sub(
+                r"\b(?:analy[sz]e|view)\b",
+                "",
+                identity,
+                flags=re.I,
+            )
         return re.sub(r"\s+", " ", identity).strip()
 
     def is_already_processed(self, element) -> bool:
@@ -338,9 +341,6 @@ class OnSocialParser:
         self._check_stop()
         result, seen = [], set()
         candidates = page.locator("a, button, [role='button'], [role='link']")
-        labels = re.compile(
-            r"^\s*(?:analy[sz]e|analy[sz]ed|view report|open report)\s*$", re.I
-        )
         for i in range(candidates.count()):
             self._check_stop()
             element = candidates.nth(i)
@@ -349,7 +349,10 @@ class OnSocialParser:
             text = (element.inner_text() or "").strip()
             aria = element.get_attribute("aria-label") or ""
             href = self._analyze_href(element)
-            if not href and not (labels.fullmatch(text) or labels.fullmatch(aria)):
+            if not href and not (
+                ANALYZE_LABEL_RE.fullmatch(text)
+                or ANALYZE_LABEL_RE.fullmatch(aria)
+            ):
                 continue
             # Disabled grey controls can still contain a link to an existing report.
             if not element.is_enabled() and not href:

@@ -34,8 +34,8 @@ if os.path.isdir(driver_dir):
             driver_datas.append((path, dest_dir))
 
 target_arch = os.environ.get("PYINSTALLER_TARGET_ARCH")
-if target_arch not in {None, "arm64", "x86_64", "universal2"}:
-    raise SystemExit(f"Unsupported PYINSTALLER_TARGET_ARCH: {target_arch}")
+if target_arch not in {None, "arm64"}:
+    raise SystemExit(f"Unsupported PYINSTALLER_TARGET_ARCH: {target_arch}; only arm64 is supported")
 
 a = Analysis(
     ["../launcher.py"],

@@ -2,55 +2,12 @@ from __future__ import annotations
 
 import os
 import platform
-import shutil
 import sys
 import tempfile
 import traceback
 from pathlib import Path
 
-
-def _chrome_executable_candidates() -> list[Path]:
-    home = Path.home()
-    if sys.platform == "darwin":
-        return [
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            home / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome",
-            Path("/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
-        ]
-    if os.name == "nt":
-        roots = [
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-            os.environ.get("LOCALAPPDATA"),
-        ]
-        return [
-            Path(root) / "Google/Chrome/Application/chrome.exe"
-            for root in roots
-            if root
-        ]
-    return [Path(p) for p in ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable")]
-
-
-def _find_chrome() -> Path | None:
-    for candidate in _chrome_executable_candidates():
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    for name in ("google-chrome", "google-chrome-stable", "chrome"):
-        found = shutil.which(name)
-        if found:
-            return Path(found)
-    return None
-
-
-def _application_data_dir() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "OnSocialLocalParser"
-    if os.name == "nt":
-        root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        if root:
-            return Path(root) / "OnSocialLocalParser"
-        return Path.home() / "AppData" / "Local" / "OnSocialLocalParser"
-    return Path.home() / ".local" / "share" / "OnSocialLocalParser"
+from config import APP_DATA_DIR, find_system_chrome
 
 
 def run_self_test() -> int:
@@ -62,7 +19,7 @@ def run_self_test() -> int:
     if sys.platform == "darwin":
         print(f"Executable: {sys.executable}")
 
-    data_dir = _application_data_dir()
+    data_dir = APP_DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
     probe = data_dir / ".selftest-write-probe"
     probe.write_text("ok", encoding="utf-8")
@@ -86,7 +43,7 @@ def run_self_test() -> int:
         raise RuntimeError(f"Playwright driver is not executable: {driver}")
     print(f"PASS: Playwright driver exists: {driver}")
 
-    chrome = _find_chrome()
+    chrome = find_system_chrome()
     if chrome is None:
         raise RuntimeError(
             "Google Chrome was not found. ParserOnSocial uses channel=\"chrome\" "

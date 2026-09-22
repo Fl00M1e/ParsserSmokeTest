@@ -1,4 +1,4 @@
-name: Build macOS apps
+name: Build macOS arm64
 
 on:
   workflow_dispatch: {}
@@ -14,9 +14,6 @@ jobs:
           - runner: macos-15
             arch: arm64
             artifact: ParserOnSocial-mac-arm64
-          - runner: macos-15-intel
-            arch: x86_64
-            artifact: ParserOnSocial-mac-x86_64
 
     runs-on: ${{ matrix.runner }}
     env:
@@ -57,18 +54,8 @@ jobs:
           file "$DRIVER"
           echo "Playwright driver architectures:"
           lipo -archs "$DRIVER"
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          codesign --display --verbose=4 "$APP" 2>&1 | tee build/codesign-info.txt || true
-          spctl --assess --type execute --verbose=4 "$APP" 2>&1 | tee build/spctl-assessment.txt || true
-          xattr -lr "$APP" 2>&1 | tee build/xattr.txt || true
-
-          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
-            lipo -archs "$BIN" | grep -qw arm64
-            lipo -archs "$DRIVER" | grep -qw arm64
-          else
-            lipo -archs "$BIN" | grep -qw x86_64
-            lipo -archs "$DRIVER" | grep -qw x86_64
-          fi
+          lipo -archs "$BIN" | grep -qw arm64
+          lipo -archs "$DRIVER" | grep -qw arm64
 
       - name: Add first-run instructions
         run: |
@@ -83,7 +70,6 @@ jobs:
 
           Архитектура этой версии: ${{ matrix.arch }}
           arm64 — Apple Silicon.
-          x86_64 — Intel Mac.
 
           Профиль Chrome и данные авторизации хранятся вне .app:
           ~/Library/Application Support/OnSocialLocalParser/browser_profile

@@ -7,4 +7,9 @@ browser_profile/
 debug_dump.txt
 build/work-current/
 build/dist/
+build/refactor-*/
+build/refactor-*.log
 build/selftest-current.log
+*.app
+*.zip
+ParserOnSocial.exe

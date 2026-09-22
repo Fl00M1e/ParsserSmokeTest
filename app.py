@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import queue
 import re
-import shutil
-import sys
 import threading
 import traceback
 import tkinter as tk
@@ -18,6 +16,7 @@ from config import (
     DEFAULT_MAX_INFLUENCERS,
     DEFAULT_MAX_UNLOCKS,
     DEFAULT_TIMEOUT_MS,
+    find_system_chrome,
 )
 
 from parser import OnSocialParser, StopRequested
@@ -35,50 +34,7 @@ from sheets import GoogleSheetsWriter, SheetsSafetyError
 # и показываем понятное сообщение.
 
 def _system_chrome_found() -> bool:
-    """
-    Быстрая эвристическая проверка наличия Google Chrome.
-
-    Не гарантирует 100% точность (например, нестандартное
-    место установки), но покрывает подавляющее большинство
-    случаев на macOS, Windows и Linux.
-    """
-
-    if sys.platform == "darwin":
-        candidates = [
-            "/Applications/Google Chrome.app",
-            str(
-                __import__("pathlib").Path.home()
-                / "Applications"
-                / "Google Chrome.app"
-            ),
-        ]
-
-    elif sys.platform.startswith("win"):
-        import os
-
-        candidates = [
-            os.path.expandvars(
-                r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"
-            ),
-            os.path.expandvars(
-                r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
-            ),
-            os.path.expandvars(
-                r"%LocalAppData%\Google\Chrome\Application\chrome.exe"
-            ),
-        ]
-
-    else:
-        # Linux и всё остальное.
-        for name in ("google-chrome", "google-chrome-stable"):
-            if shutil.which(name):
-                return True
-
-        return False
-
-    import os
-
-    return any(os.path.exists(path) for path in candidates)
+    return find_system_chrome() is not None
 
 
 class App:
@@ -797,9 +753,6 @@ class App:
                     if command == "open_browser":
                         self._worker_open_browser()
 
-                    elif command == "check_page":
-                        self._worker_check_page()
-
                     elif command == "connect_sheets":
                         self._worker_connect_sheets(
                             args,
@@ -974,70 +927,6 @@ class App:
             "Как пользоваться ParserOnSocial",
             message,
         )
-
-    # ============================================================
-    # CHECK PAGE — WORKER
-    # ============================================================
-
-    def _worker_check_page(self):
-
-        if not self.context or not self.list_page:
-
-            self.log(
-                "Сначала нажми «1. Открыть ON Social»."
-            )
-
-            return
-
-        self.log(
-            "Проверяю текущую страницу..."
-        )
-
-        self.list_page.bring_to_front()
-
-        title = self.list_page.title()
-
-        url = self.list_page.url
-
-        self.log(
-            f"Страница: {title}"
-        )
-
-        self.log(
-            f"URL: {url}"
-        )
-
-        parser = OnSocialParser(
-            self.context,
-            log=self.log,
-        )
-
-        buttons = parser.find_analyze_buttons(
-            self.list_page,
-        )
-
-        unlock = parser.find_unlock_button(
-            self.list_page,
-        )
-
-        self.log(
-            f"Доступных Analyze: {len(buttons)}"
-        )
-
-        self.log(
-            "Unlock next: найден"
-            if unlock
-            else
-            "Unlock next: не найден"
-        )
-
-        if not buttons:
-
-            self.log(
-                "Analyze не найдены. "
-                "Убедись, что открыта страница "
-                "Influencer Identification со списком блогеров."
-            )
 
     # ============================================================
     # CONNECT SHEETS — WORKER
@@ -1429,8 +1318,11 @@ class App:
                     # The writer checks a fresh sheet snapshot, including empty
                     # contacts, and returns only rows whose insertion was verified.
                     written_rows = self.sheets.append_rows(rows)
-                    self.table_cache_pairs = set(self.sheets.verified_pairs)
-                    parser.processed_profile_email_pairs = set(self.table_cache_pairs)
+                    # Merge only the latest confirmed pairs.
+                    self.table_cache_pairs.update(self.sheets.last_verified_pairs)
+                    parser.processed_profile_email_pairs.update(
+                        self.sheets.last_verified_pairs
+                    )
                     if not written_rows:
                         self.log("Профиль пропущен: новых строк для таблицы нет.")
                         continue
@@ -1668,25 +1560,6 @@ class App:
 
         self._queue_command(
             "open_browser",
-        )
-
-    # ============================================================
-    # CHECK PAGE
-    # ============================================================
-
-    def check_page(self):
-
-        if not self.browser_ready:
-
-            messagebox.showwarning(
-                "Браузер",
-                "Сначала нажми «1. Открыть ON Social».",
-            )
-
-            return
-
-        self._queue_command(
-            "check_page",
         )
 
     # ============================================================
